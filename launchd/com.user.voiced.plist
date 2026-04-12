@@ -6,7 +6,7 @@
     <string>com.user.voiced</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mustafa/projects/dwekat/voiced/dist/voiced</string>
+        <string>/Users/mustafa/projects/byteink/voiced/dist/voiced</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
