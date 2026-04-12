@@ -1,0 +1,15 @@
+{
+  "name": "voiced",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Local-only, OpenAI-compatible voice gateway. STT via whisper.cpp. TTS reserved.",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "dev": "bun --hot run src/main.ts",
+    "build": "rm -f .*.bun-build && bun build --compile --minify --sourcemap src/main.ts --outfile dist/voiced && codesign -s - --force dist/voiced"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
