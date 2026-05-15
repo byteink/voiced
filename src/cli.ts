@@ -156,7 +156,8 @@ export async function cmdDoctor(): Promise<void> {
   process.exit(allOk ? 0 : 1);
 }
 
-const LABEL = "com.user.voiced";
+const LABEL = "com.byteink.voiced";
+const LEGACY_LABELS = ["com.user.voiced"];
 
 function launchctl(args: string[]): { code: number; out: string; err: string } {
   const proc = Bun.spawnSync(["launchctl", ...args], { stdout: "pipe", stderr: "pipe" });
@@ -177,6 +178,15 @@ function ensureDirs(): void {
   }
   const agents = `${process.env.HOME}/Library/LaunchAgents`;
   if (!existsSync(agents)) mkdirSync(agents, { recursive: true });
+}
+
+function purgeLegacyAgents(): void {
+  for (const label of LEGACY_LABELS) {
+    const p = `${process.env.HOME}/Library/LaunchAgents/${label}.plist`;
+    if (!existsSync(p)) continue;
+    launchctl(["bootout", `gui/${process.getuid?.() ?? ""}/${label}`]);
+    unlinkSync(p);
+  }
 }
 
 function resolveBinPath(): string {
@@ -232,6 +242,7 @@ function writePlist(): void {
 
 export function cmdStart(): void {
   ensureDirs();
+  purgeLegacyAgents();
   writePlist();
   const r = launchctl(["bootstrap", `gui/${process.getuid?.() ?? ""}`, plistPath()]);
   if (r.code === 0) { console.log("started"); return; }
@@ -251,9 +262,17 @@ export function cmdStop(): void {
 
 export function cmdRestart(): void {
   ensureDirs();
+  purgeLegacyAgents();
   writePlist();
-  const r = launchctl(["kickstart", "-k", `gui/${process.getuid?.() ?? ""}/${LABEL}`]);
+  const uid = process.getuid?.() ?? "";
+  const r = launchctl(["kickstart", "-k", `gui/${uid}/${LABEL}`]);
   if (r.code === 0) { console.log("restarted"); return; }
+  if (/could not find|no such/i.test(r.err)) {
+    const b = launchctl(["bootstrap", `gui/${uid}`, plistPath()]);
+    if (b.code === 0) { console.log("started"); return; }
+    console.error(b.err || `bootstrap failed (${b.code})`);
+    process.exit(1);
+  }
   console.error(r.err || `kickstart failed (${r.code})`);
   process.exit(1);
 }
