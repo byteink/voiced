@@ -1,4 +1,4 @@
-import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { PATHS, WHISPER_BIN, PORT } from "./config.ts";
 import { STT_CATALOG } from "./registry.ts";
@@ -179,8 +179,19 @@ function ensureDirs(): void {
   if (!existsSync(agents)) mkdirSync(agents, { recursive: true });
 }
 
+function resolveBinPath(): string {
+  // Prefer stable brew symlink so the plist survives `brew upgrade voiced`.
+  const real = realpathSync(process.execPath);
+  for (const candidate of ["/opt/homebrew/bin/voiced", "/usr/local/bin/voiced"]) {
+    try {
+      if (realpathSync(candidate) === real) return candidate;
+    } catch {}
+  }
+  return process.execPath;
+}
+
 function writePlist(): void {
-  const bin = process.execPath;
+  const bin = resolveBinPath();
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
