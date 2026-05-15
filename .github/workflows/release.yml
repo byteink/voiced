@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build binary
+        run: bun run build
+
+      - name: Package
+        id: pkg
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="voiced_Darwin_arm64.tar.gz"
+          tar -czf "$ARCHIVE" -C dist voiced
+          SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+          echo "version=$VERSION"  >> "$GITHUB_OUTPUT"
+          echo "archive=$ARCHIVE"  >> "$GITHUB_OUTPUT"
+          echo "sha256=$SHA"       >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            "${{ steps.pkg.outputs.archive }}"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: byteink/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ steps.pkg.outputs.version }}
+          SHA256:  ${{ steps.pkg.outputs.sha256 }}
+        run: |
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/voiced.rb <<EOF
+          class Voiced < Formula
+            desc "Local OpenAI-compatible voice gateway (STT via whisper.cpp)"
+            homepage "https://github.com/byteink/voiced"
+            url "https://github.com/byteink/voiced/releases/download/v${VERSION}/voiced_Darwin_arm64.tar.gz"
+            sha256 "${SHA256}"
+            license "MIT"
+            version "${VERSION}"
+
+            depends_on arch: :arm64
+            depends_on :macos
+            depends_on "ffmpeg"
+            depends_on "whisper-cpp"
+
+            def install
+              bin.install "voiced"
+            end
+
+            def caveats
+              <<~CAVEATS
+                Add a model and start the agent:
+                  voiced add large-v3-turbo
+                  voiced start
+
+                The agent installs a launchd plist at
+                  ~/Library/LaunchAgents/com.user.voiced.plist
+                and listens on http://127.0.0.1:2022
+              CAVEATS
+            end
+
+            test do
+              system "#{bin}/voiced", "help"
+            end
+          end
+          EOF
+
+      - name: Commit formula
+        working-directory: homebrew-tap
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/voiced.rb
+          if git diff --cached --quiet; then
+            echo "no changes to formula"
+            exit 0
+          fi
+          git commit -m "voiced ${{ steps.pkg.outputs.version }}"
+          git push

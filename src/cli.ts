@@ -1,5 +1,5 @@
-import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
-import { join, basename } from "node:path";
+import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { PATHS, WHISPER_BIN, PORT } from "./config.ts";
 import { STT_CATALOG } from "./registry.ts";
 
@@ -80,7 +80,7 @@ export async function cmdAdd(name: string): Promise<void> {
   await Bun.write(dest, Bun.file(tmp));
   unlinkSync(tmp);
   console.log(`installed: ${dest}`);
-  console.log("reload the running server: launchctl kickstart -k gui/$UID/com.user.voiced");
+  console.log("reload the running server: voiced restart");
 }
 
 export function cmdRm(name: string): void {
@@ -91,7 +91,7 @@ export function cmdRm(name: string): void {
   }
   unlinkSync(target.file);
   console.log(`removed: ${target.file}`);
-  console.log("reload: launchctl kickstart -k gui/$UID/com.user.voiced");
+  console.log("reload: voiced restart");
 }
 
 async function checkEndpoint(): Promise<{ ok: boolean; detail: string }> {
@@ -137,11 +137,11 @@ export async function cmdDoctor(): Promise<void> {
   });
 
   // 5. LaunchAgent
-  const plist = `${process.env.HOME}/Library/LaunchAgents/com.user.voiced.plist`;
+  const plist = plistPath();
   checks.push({
     name: "launchd plist",
     ok: existsSync(plist),
-    detail: existsSync(plist) ? plist : "not installed — run scripts/install.sh",
+    detail: existsSync(plist) ? plist : "not installed — run: voiced start",
   });
 
   // 6. HTTP endpoint
@@ -171,16 +171,57 @@ function plistPath(): string {
   return `${process.env.HOME}/Library/LaunchAgents/${LABEL}.plist`;
 }
 
-function ensurePlist(): void {
-  if (!existsSync(plistPath())) {
-    console.error(`launchd plist missing: ${plistPath()}`);
-    console.error("run: bash scripts/install.sh");
-    process.exit(1);
+function ensureDirs(): void {
+  for (const d of [PATHS.home, PATHS.stt, PATHS.tts, PATHS.logs]) {
+    if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
+  const agents = `${process.env.HOME}/Library/LaunchAgents`;
+  if (!existsSync(agents)) mkdirSync(agents, { recursive: true });
+}
+
+function writePlist(): void {
+  const bin = process.execPath;
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${bin}</string>
+        <string>serve</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>VOICED_PORT</key>
+        <string>${PORT}</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>${PATHS.logs}/voiced.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>${PATHS.logs}/voiced.err.log</string>
+    <key>WorkingDirectory</key>
+    <string>${PATHS.home}</string>
+</dict>
+</plist>
+`;
+  writeFileSync(plistPath(), plist);
 }
 
 export function cmdStart(): void {
-  ensurePlist();
+  ensureDirs();
+  writePlist();
   const r = launchctl(["bootstrap", `gui/${process.getuid?.() ?? ""}`, plistPath()]);
   if (r.code === 0) { console.log("started"); return; }
   if (/already loaded|service already/i.test(r.err)) { console.log("already running"); return; }
@@ -190,13 +231,16 @@ export function cmdStart(): void {
 
 export function cmdStop(): void {
   const r = launchctl(["bootout", `gui/${process.getuid?.() ?? ""}/${LABEL}`]);
-  if (r.code === 0 || /could not find|no such/i.test(r.err)) { console.log("stopped"); return; }
+  const ok = r.code === 0 || /could not find|no such/i.test(r.err);
+  if (existsSync(plistPath())) unlinkSync(plistPath());
+  if (ok) { console.log("stopped"); return; }
   console.error(r.err || `bootout failed (${r.code})`);
   process.exit(1);
 }
 
 export function cmdRestart(): void {
-  ensurePlist();
+  ensureDirs();
+  writePlist();
   const r = launchctl(["kickstart", "-k", `gui/${process.getuid?.() ?? ""}/${LABEL}`]);
   if (r.code === 0) { console.log("restarted"); return; }
   console.error(r.err || `kickstart failed (${r.code})`);

@@ -51,17 +51,14 @@ voiced/
 ├── src/
 │   ├── main.ts           CLI dispatcher
 │   ├── server.ts         HTTP gateway + supervisor
-│   ├── cli.ts            ls / add / rm / doctor
+│   ├── cli.ts            ls / add / rm / doctor / start / stop
 │   ├── registry.ts       curated STT model catalogue
 │   └── config.ts         paths + env vars
+├── .github/workflows/
+│   └── release.yml       build + publish to byteink/homebrew-tap
 ├── package.json
 ├── tsconfig.json
-├── dist/voiced           compiled binary (gitignored)
-├── launchd/
-│   └── com.user.voiced.plist
-└── scripts/
-    ├── install.sh
-    └── uninstall.sh
+└── dist/voiced           compiled binary (gitignored)
 ```
 
 Runtime state (outside the repo):
@@ -80,27 +77,34 @@ Runtime state (outside the repo):
 ## Requirements
 
 - macOS on Apple Silicon.
-- `brew install whisper-cpp ffmpeg`
-- `bun` to build. Compiled binary has no runtime dep.
-- Tailscale, this Mac reachable as `mustafa-macbook-pro`.
+- Tailscale (optional, for remote access).
+
+Runtime deps (`whisper-cpp`, `ffmpeg`) are pulled in by the Homebrew formula.
 
 ---
 
 ## Install
 
 ```bash
-bash scripts/install.sh
+brew install byteink/tap/voiced
+voiced add large-v3-turbo
+voiced start
 ```
 
-Builds the binary if missing, creates `~/.voiced/{logs,models,voices}`,
-installs the launchd agent, starts it.
-
-On first install `voiced` exits immediately with `no STT models in
-~/.voiced/models`. Add a model:
+`voiced start` creates `~/.voiced/{logs,models,voices}`, writes the
+launchd agent to `~/Library/LaunchAgents/com.user.voiced.plist`, and
+bootstraps it. The agent runs at every login. Verify:
 
 ```bash
-dist/voiced add large-v3-turbo
-launchctl kickstart -k gui/$UID/com.user.voiced
+curl http://127.0.0.1:2022/health
+```
+
+### Build from source
+
+```bash
+bun install
+bun run build      # → dist/voiced
+./dist/voiced start
 ```
 
 ---
@@ -178,7 +182,7 @@ hardcode the path don't get generic 404s.
 
 ## Configuration
 
-Env vars (set in the plist):
+Env vars (read at server start, written into the plist by `voiced start`):
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -188,7 +192,8 @@ Env vars (set in the plist):
 | `VOICED_WHISPER_BIN` | `/opt/homebrew/bin/whisper-server` | Child binary |
 | `VOICED_THREADS` | `8` | Threads per child |
 
-Edit `launchd/com.user.voiced.plist` then re-run `scripts/install.sh`.
+To override, edit `~/Library/LaunchAgents/com.user.voiced.plist` and run
+`voiced restart`.
 
 ---
 
@@ -205,17 +210,16 @@ OPENAI_AUDIO_MODEL=whisper-1
 ## Operations
 
 ```bash
-launchctl list | grep voiced                          # status
-tail -f ~/.voiced/logs/voiced.err.log                 # logs
-launchctl kickstart -k gui/$UID/com.user.voiced       # reload
-kill -9 $(pgrep -f dist/voiced); sleep 12; curl .../health   # restart test
+voiced status                                # launchd + /health
+tail -f ~/.voiced/logs/voiced.err.log        # logs
+voiced restart                               # reload
 ```
 
-### Rebuild after code change
+### Rebuild after code change (dev)
 
 ```bash
 bun run build
-launchctl kickstart -k gui/$UID/com.user.voiced
+voiced restart
 ```
 
 ---
@@ -233,8 +237,9 @@ launchctl kickstart -k gui/$UID/com.user.voiced
 ## Uninstall
 
 ```bash
-bash scripts/uninstall.sh
+voiced stop
+brew uninstall voiced
 ```
 
-Leaves `~/.voiced/` intact. Remove it manually if you also want the
-models gone.
+`voiced stop` removes the launchd plist. `~/.voiced/` is left intact —
+delete it manually if you also want the models gone.
