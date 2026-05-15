@@ -108,12 +108,18 @@ launchctl kickstart -k gui/$UID/com.user.voiced
 ## CLI
 
 ```bash
-voiced              # start HTTP server (what launchd runs)
+voiced              # show help
+voiced status      # launchd + /health status
+voiced start        # load launchd agent
+voiced stop         # unload launchd agent
+voiced restart      # kickstart the agent
+
 voiced ls           # installed + available models
 voiced add <name>   # download from catalogue
 voiced rm  <name>   # delete installed model
 voiced doctor       # system health check
-voiced help
+
+voiced serve        # run HTTP server in foreground (launchd uses this)
 ```
 
 The CLI operates on the same data dir as the server, so `ls` and `add`

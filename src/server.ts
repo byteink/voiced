@@ -1,7 +1,7 @@
 // voiced HTTP server + supervisor for native STT children.
 
 import { spawn, type Subprocess } from "bun";
-import { readdirSync, existsSync, mkdirSync } from "node:fs";
+import { readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES } from "./config.ts";
 
@@ -153,11 +153,39 @@ function handleSpeechStub(): Response {
   return jsonError(501, "not_implemented", "TTS (/v1/audio/speech) not yet available");
 }
 
+const LOCK_FILE = join(PATHS.home, "voiced.pid");
+
+function pidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function acquireLock(): void {
+  if (existsSync(LOCK_FILE)) {
+    const raw = readFileSync(LOCK_FILE, "utf8").trim();
+    const pid = Number(raw);
+    if (Number.isFinite(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) {
+      console.error(
+        `voiced already running (PID ${pid}). reload with: launchctl kickstart -k gui/$UID/com.user.voiced`,
+      );
+      process.exit(1);
+    }
+  }
+  writeFileSync(LOCK_FILE, String(process.pid));
+}
+
+function releaseLock(): void {
+  try {
+    const raw = readFileSync(LOCK_FILE, "utf8").trim();
+    if (Number(raw) === process.pid) unlinkSync(LOCK_FILE);
+  } catch {}
+}
+
 function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   log("shutdown");
   for (const c of children.values()) { try { c.proc.kill("SIGTERM"); } catch {} }
+  releaseLock();
   setTimeout(() => process.exit(0), 1500);
 }
 
@@ -165,11 +193,15 @@ process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
 export async function runServer(): Promise<void> {
+  if (!existsSync(PATHS.home)) mkdirSync(PATHS.home, { recursive: true });
   if (!existsSync(PATHS.logs)) mkdirSync(PATHS.logs, { recursive: true });
   if (!existsSync(PATHS.stt)) mkdirSync(PATHS.stt, { recursive: true });
 
+  acquireLock();
+
   const found = discoverSttModels();
   if (found.length === 0) {
+    releaseLock();
     console.error(`no STT models in ${PATHS.stt}. run: voiced add <name>`);
     process.exit(1);
   }
@@ -178,20 +210,32 @@ export async function runServer(): Promise<void> {
   found.forEach((m, i) => supervise(m.name, m.path, BASE_PORT + i));
   await Promise.all([...children.values()].map((c) => waitReady(c.port, 60_000)));
 
-  Bun.serve({
-    port: PORT,
-    hostname: "0.0.0.0",
-    idleTimeout: 120,
-    async fetch(req: Request) {
-      const url = new URL(req.url);
-      if (url.pathname === "/health") return handleHealth();
-      if (url.pathname === "/v1/models") return handleModels();
-      if (url.pathname === "/v1/audio/transcriptions") return handleTranscribe(req);
-      if (url.pathname === "/v1/audio/speech") return handleSpeechStub();
-      if (url.pathname === "/") return new Response("voiced\n");
-      return jsonError(404, "not_found", `no route for ${url.pathname}`);
-    },
-  });
+  try {
+    Bun.serve({
+      port: PORT,
+      hostname: "0.0.0.0",
+      idleTimeout: 120,
+      async fetch(req: Request) {
+        const url = new URL(req.url);
+        if (url.pathname === "/health") return handleHealth();
+        if (url.pathname === "/v1/models") return handleModels();
+        if (url.pathname === "/v1/audio/transcriptions") return handleTranscribe(req);
+        if (url.pathname === "/v1/audio/speech") return handleSpeechStub();
+        if (url.pathname === "/") return new Response("voiced\n");
+        return jsonError(404, "not_found", `no route for ${url.pathname}`);
+      },
+    });
+  } catch (err) {
+    const msg = (err as Error).message ?? String(err);
+    if (/EADDRINUSE|address already in use/i.test(msg)) {
+      console.error(`voiced port ${PORT} already in use. another instance is running.`);
+    } else {
+      console.error(`failed to bind :${PORT}: ${msg}`);
+    }
+    for (const c of children.values()) { try { c.proc.kill("SIGTERM"); } catch {} }
+    releaseLock();
+    process.exit(1);
+  }
 
   log("listening", { port: PORT, models: [...children.keys()] });
 }

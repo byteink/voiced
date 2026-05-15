@@ -156,18 +156,82 @@ export async function cmdDoctor(): Promise<void> {
   process.exit(allOk ? 0 : 1);
 }
 
+const LABEL = "com.user.voiced";
+
+function launchctl(args: string[]): { code: number; out: string; err: string } {
+  const proc = Bun.spawnSync(["launchctl", ...args], { stdout: "pipe", stderr: "pipe" });
+  return {
+    code: proc.exitCode ?? -1,
+    out: proc.stdout.toString().trim(),
+    err: proc.stderr.toString().trim(),
+  };
+}
+
+function plistPath(): string {
+  return `${process.env.HOME}/Library/LaunchAgents/${LABEL}.plist`;
+}
+
+function ensurePlist(): void {
+  if (!existsSync(plistPath())) {
+    console.error(`launchd plist missing: ${plistPath()}`);
+    console.error("run: bash scripts/install.sh");
+    process.exit(1);
+  }
+}
+
+export function cmdStart(): void {
+  ensurePlist();
+  const r = launchctl(["bootstrap", `gui/${process.getuid?.() ?? ""}`, plistPath()]);
+  if (r.code === 0) { console.log("started"); return; }
+  if (/already loaded|service already/i.test(r.err)) { console.log("already running"); return; }
+  console.error(r.err || `bootstrap failed (${r.code})`);
+  process.exit(1);
+}
+
+export function cmdStop(): void {
+  const r = launchctl(["bootout", `gui/${process.getuid?.() ?? ""}/${LABEL}`]);
+  if (r.code === 0 || /could not find|no such/i.test(r.err)) { console.log("stopped"); return; }
+  console.error(r.err || `bootout failed (${r.code})`);
+  process.exit(1);
+}
+
+export function cmdRestart(): void {
+  ensurePlist();
+  const r = launchctl(["kickstart", "-k", `gui/${process.getuid?.() ?? ""}/${LABEL}`]);
+  if (r.code === 0) { console.log("restarted"); return; }
+  console.error(r.err || `kickstart failed (${r.code})`);
+  process.exit(1);
+}
+
+export async function cmdStatus(): Promise<void> {
+  const r = launchctl(["list"]);
+  const line = r.out.split("\n").find((l) => l.includes(LABEL));
+  if (!line) { console.log("not loaded"); return; }
+  const [pid, exit] = line.split(/\s+/);
+  console.log(`launchd: pid=${pid} last_exit=${exit} label=${LABEL}`);
+  const ep = await checkEndpoint();
+  console.log(`health:  ${ep.ok ? "ok" : "down"} — ${ep.detail}`);
+}
+
 export function cmdHelp(): void {
   console.log(`voiced — OpenAI-compatible local STT gateway
 
 Usage:
-  voiced              Start the HTTP server (use launchd in production)
-  voiced ls           List installed + available models
-  voiced add <name>   Download a model from the catalogue
-  voiced rm <name>    Delete an installed model
-  voiced doctor       Check system health (paths, binaries, endpoint)
-  voiced help         Show this message
+  voiced help              Show this message
+  voiced status            Show launchd + health status
+  voiced start             Load the launchd agent
+  voiced stop              Unload the launchd agent
+  voiced restart           Restart the launchd agent
+
+  voiced ls                List installed + available models
+  voiced add <name>        Download a model from the catalogue
+  voiced rm <name>         Delete an installed model
+  voiced doctor            Check system health (paths, binaries, endpoint)
+
+  voiced serve             Run the HTTP server in foreground (launchd uses this)
 
 Data dir: ${PATHS.home}
 Endpoint: http://127.0.0.1:${PORT}
+Logs:     ${PATHS.logs}/voiced.{out,err}.log
 `);
 }
