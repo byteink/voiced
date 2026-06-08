@@ -1,6 +1,6 @@
 {
   "name": "voiced",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "type": "module",
   "description": "Local-only, OpenAI-compatible voice gateway. STT via whisper.cpp. TTS reserved.",

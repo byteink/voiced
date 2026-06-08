@@ -121,6 +121,8 @@ voiced restart      # kickstart the agent
 voiced ls           # installed + available models
 voiced add <name>   # download from catalogue
 voiced rm  <name>   # delete installed model
+voiced diarize install   # add speaker-diarization support (~57 MB, opt-in)
+voiced diarize status    # diarization install status
 voiced doctor       # system health check
 
 voiced serve        # run HTTP server in foreground (launchd uses this)
@@ -158,6 +160,24 @@ installed, HTTP endpoint responsive. Exits non-zero on any failure.
 OpenAI-compatible. Multipart form: `file`, `model`, `language`, `prompt`,
 `temperature`, `response_format` (`json`/`text`/`srt`/`verbose_json`/`vtt`).
 Unknown fields are dropped.
+
+**Speaker diarization (opt-in).** Pass `diarize=true` to label who spoke each
+segment. Requires `response_format=verbose_json` and `voiced diarize install`
+(downloads a native [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) ONNX
+diarizer + models into `~/.voiced/diarize` — no Python). Every segment gains a
+`speaker` field (`"SPEAKER_00"`, `"SPEAKER_01"`, …); the rest of the response is
+unchanged. Optional `num_speakers=<n>` pins the exact count when known —
+otherwise speakers are auto-detected. Default requests (no `diarize`) are
+byte-identical to upstream.
+
+Diarization is **full-file only**: speaker labels come from clustering the whole
+recording, so they cannot stay consistent across separate short streaming
+requests. Send a complete recording in one request.
+
+```jsonc
+// verbose_json segment with diarize=true
+{ "id": 0, "start": 0.0, "end": 5.64, "text": " a pencil…", "speaker": "SPEAKER_00" }
+```
 
 ### `GET /v1/models`
 

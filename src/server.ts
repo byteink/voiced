@@ -4,6 +4,7 @@ import { spawn, type Subprocess } from "bun";
 import { readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES } from "./config.ts";
+import { diarizeInstalled, runDiarization, speakerForSegment } from "./diarize.ts";
 
 type Child = { name: string; port: number; path: string; proc: Subprocess };
 
@@ -106,6 +107,8 @@ async function handleTranscribe(req: Request): Promise<Response> {
       `model '${String(requested)}' not loaded. available: ${[...children.keys()].join(", ")}`);
   }
 
+  if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child);
+
   const out = new FormData();
   out.append("file", file, (file as File).name ?? "audio");
   for (const key of ["language", "prompt", "temperature", "response_format"] as const) {
@@ -130,6 +133,104 @@ async function handleTranscribe(req: Request): Promise<Response> {
     status: upstream.status,
     headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
   });
+}
+
+function isTruthy(v: FormDataEntryValue | null): boolean {
+  return typeof v === "string" && /^(1|true|yes|on)$/i.test(v.trim());
+}
+
+function parsePositiveInt(v: FormDataEntryValue | null): number | undefined {
+  if (typeof v !== "string") return undefined;
+  const n = Number.parseInt(v, 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+// Transcribe the child whisper-server on a pre-converted wav, returning the
+// parsed verbose_json document or a pass-through error Response.
+async function transcribeWav(
+  wavPath: string,
+  inForm: FormData,
+  child: Child,
+): Promise<{ ok: true; doc: { segments?: Array<{ start: number; end: number; speaker?: string }> } } | { ok: false; res: Response }> {
+  const out = new FormData();
+  out.append("file", Bun.file(wavPath), "audio.wav");
+  for (const key of ["language", "prompt", "temperature"] as const) {
+    const v = inForm.get(key);
+    if (typeof v === "string" && v.length > 0) out.append(key, v);
+  }
+  out.append("response_format", "verbose_json");
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out });
+  } catch (err) {
+    return { ok: false, res: jsonError(502, "upstream_unreachable",
+      `whisper-server for '${child.name}' not reachable: ${(err as Error).message}`) };
+  }
+  if (!upstream.ok) {
+    const errBody = await upstream.arrayBuffer();
+    return { ok: false, res: new Response(errBody, {
+      status: upstream.status,
+      headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
+    }) };
+  }
+  return { ok: true, doc: await upstream.json() };
+}
+
+// diarize=true path: normalise audio once, transcribe and diarize the same wav,
+// then tag each verbose_json segment with the overlapping speaker. The default
+// (no diarize) path above is untouched and byte-identical to upstream.
+async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Child): Promise<Response> {
+  if (!diarizeInstalled()) {
+    return jsonError(503, "diarization_unavailable", "diarization not installed. run: voiced diarize install");
+  }
+  const rf = inForm.get("response_format");
+  if (typeof rf === "string" && rf.length > 0 && rf !== "verbose_json") {
+    return jsonError(400, "unsupported_response_format", "diarize=true requires response_format=verbose_json");
+  }
+  const numSpeakers = parsePositiveInt(inForm.get("num_speakers"));
+
+  const id = crypto.randomUUID();
+  const inPath = `/tmp/voiced-${id}.in`;
+  const wavPath = `/tmp/voiced-${id}.wav`;
+  const started = Date.now();
+  try {
+    await Bun.write(inPath, file);
+
+    // sherpa requires 16 kHz mono PCM; whisper-server accepts it directly.
+    const ff = spawn({
+      cmd: ["ffmpeg", "-y", "-i", inPath, "-ar", "16000", "-ac", "1", "-f", "wav", wavPath],
+      stdout: "ignore", stderr: "pipe",
+    });
+    await ff.exited;
+    if (ff.exitCode !== 0) {
+      const err = (await new Response(ff.stderr).text()).trim().split("\n").at(-1) ?? "unknown";
+      return jsonError(400, "audio_decode_failed", `ffmpeg could not decode audio: ${err}`);
+    }
+
+    const [whisper, ranges] = await Promise.all([
+      transcribeWav(wavPath, inForm, child),
+      runDiarization(wavPath, { numSpeakers }),
+    ]);
+    if (!whisper.ok) return whisper.res;
+
+    const doc = whisper.doc;
+    if (Array.isArray(doc.segments)) {
+      for (const seg of doc.segments) {
+        seg.speaker = speakerForSegment(seg.start, seg.end, ranges) ?? "SPEAKER_00";
+      }
+    }
+    const speakers = new Set(ranges.map((r) => r.speaker)).size;
+    log("transcribe+diarize", {
+      model: child.name, segments: doc.segments?.length ?? 0, speakers,
+      ms: Date.now() - started,
+    });
+    return Response.json(doc);
+  } catch (err) {
+    return jsonError(502, "diarization_failed", (err as Error).message);
+  } finally {
+    for (const p of [inPath, wavPath]) { try { unlinkSync(p); } catch {} }
+  }
 }
 
 async function handleHealth(): Promise<Response> {

@@ -2,6 +2,7 @@ import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync
 import { join } from "node:path";
 import { PATHS, WHISPER_BIN, PORT } from "./config.ts";
 import { STT_CATALOG } from "./registry.ts";
+import { diarizeInstalled, installDiarize, diarizeDir } from "./diarize.ts";
 
 function human(bytes: number): string {
   const units = ["B", "KB", "MB", "GB"];
@@ -94,6 +95,22 @@ export function cmdRm(name: string): void {
   console.log("reload: voiced restart");
 }
 
+export async function cmdDiarize(sub: string | undefined): Promise<void> {
+  if (sub === "install") {
+    await installDiarize();
+    console.log("enable per request with: diarize=true (full-file mode, response_format=verbose_json)");
+    return;
+  }
+  if (sub === undefined || sub === "status") {
+    console.log(diarizeInstalled()
+      ? `installed: ${diarizeDir()}`
+      : "not installed — run: voiced diarize install");
+    return;
+  }
+  console.error("usage: voiced diarize [install|status]");
+  process.exit(2);
+}
+
 async function checkEndpoint(): Promise<{ ok: boolean; detail: string }> {
   try {
     const r = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(1500) });
@@ -152,6 +169,7 @@ export async function cmdDoctor(): Promise<void> {
   for (const c of checks) {
     console.log(`  ${c.ok ? "✓" : "✗"} ${col(c.name, 20)} ${c.detail}`);
   }
+  console.log(`  • ${col("diarization", 20)} ${diarizeInstalled() ? "installed" : "not installed (optional) — voiced diarize install"}`);
   const allOk = checks.every((c) => c.ok);
   process.exit(allOk ? 0 : 1);
 }
@@ -300,6 +318,8 @@ Usage:
   voiced ls                List installed + available models
   voiced add <name>        Download a model from the catalogue
   voiced rm <name>         Delete an installed model
+  voiced diarize install   Add speaker-diarization support (~57 MB, opt-in)
+  voiced diarize status    Show diarization install status
   voiced doctor            Check system health (paths, binaries, endpoint)
 
   voiced serve             Run the HTTP server in foreground (launchd uses this)
