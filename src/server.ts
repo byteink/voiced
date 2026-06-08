@@ -165,7 +165,7 @@ function acquireLock(): void {
     const pid = Number(raw);
     if (Number.isFinite(pid) && pid > 0 && pid !== process.pid && pidAlive(pid)) {
       console.error(
-        `voiced already running (PID ${pid}). reload with: launchctl kickstart -k gui/$UID/com.user.voiced`,
+        `voiced already running (PID ${pid}). reload with: launchctl kickstart -k gui/$UID/io.byteink.voiced`,
       );
       process.exit(1);
     }

@@ -87,7 +87,7 @@ jobs:
                   voiced start
 
                 The agent installs a launchd plist at
-                  ~/Library/LaunchAgents/com.user.voiced.plist
+                  ~/Library/LaunchAgents/io.byteink.voiced.plist
                 and listens on http://127.0.0.1:2022
               CAVEATS
             end

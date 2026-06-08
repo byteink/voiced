@@ -92,7 +92,7 @@ voiced start
 ```
 
 `voiced start` creates `~/.voiced/{logs,models,voices}`, writes the
-launchd agent to `~/Library/LaunchAgents/com.user.voiced.plist`, and
+launchd agent to `~/Library/LaunchAgents/io.byteink.voiced.plist`, and
 bootstraps it. The agent runs at every login. Verify:
 
 ```bash
@@ -192,7 +192,7 @@ Env vars (read at server start, written into the plist by `voiced start`):
 | `VOICED_WHISPER_BIN` | `/opt/homebrew/bin/whisper-server` | Child binary |
 | `VOICED_THREADS` | `8` | Threads per child |
 
-To override, edit `~/Library/LaunchAgents/com.user.voiced.plist` and run
+To override, edit `~/Library/LaunchAgents/io.byteink.voiced.plist` and run
 `voiced restart`.
 
 ---

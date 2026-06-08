@@ -156,8 +156,8 @@ export async function cmdDoctor(): Promise<void> {
   process.exit(allOk ? 0 : 1);
 }
 
-const LABEL = "com.byteink.voiced";
-const LEGACY_LABELS = ["com.user.voiced"];
+const LABEL = "io.byteink.voiced";
+const LEGACY_LABELS = ["com.byteink.voiced"];
 
 function launchctl(args: string[]): { code: number; out: string; err: string } {
   const proc = Bun.spawnSync(["launchctl", ...args], { stdout: "pipe", stderr: "pipe" });
