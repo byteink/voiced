@@ -121,8 +121,10 @@ voiced restart      # kickstart the agent
 voiced ls           # installed + available models
 voiced add <name>   # download from catalogue
 voiced rm  <name>   # delete installed model
-voiced diarize install   # add speaker-diarization support (~57 MB, opt-in)
-voiced diarize status    # diarization install status
+voiced diarize ls        # list diarization models (sortformer / sherpa)
+voiced diarize add <name>  # download a diarization model
+voiced diarize use <name>  # select the active diarization model
+voiced diarize status    # show the active diarization model
 voiced doctor       # system health check
 
 voiced serve        # run HTTP server in foreground (launchd uses this)
@@ -162,15 +164,24 @@ OpenAI-compatible. Multipart form: `file`, `model`, `language`, `prompt`,
 Unknown fields are dropped.
 
 **Speaker diarization (opt-in).** Pass `diarize=true` to label who spoke each
-segment. Requires `response_format=verbose_json` and `voiced diarize install`
-(downloads a native [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) ONNX
-diarizer + models into `~/.voiced/diarize` — no Python). Every segment gains a
-`speaker` field (`"SPEAKER_00"`, `"SPEAKER_01"`, …); the rest of the response is
-unchanged. Optional `num_speakers=<n>` pins the exact count when known —
-otherwise speakers are auto-detected. Default requests (no `diarize`) are
-byte-identical to upstream.
+segment. Requires `response_format=verbose_json` and an installed diarization
+model. Two native, Python-free engines are selectable via `voiced diarize`:
 
-Diarization is **full-file only**: speaker labels come from clustering the whole
+- **`sortformer-v2.1`** / **`sortformer-v2`** — NVIDIA Sortformer (streaming) run
+  through the bundled `voiced-diarize` sidecar. End-to-end neural diarization
+  with far better turn detection, but a hard **4-speaker maximum**. Recommended.
+- **`sherpa`** — [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) clustering
+  (pyannote segmentation + wespeaker embeddings). Handles **any** number of
+  speakers; lower turn accuracy. The original engine.
+
+Install and select one, e.g. `voiced diarize add sortformer-v2.1 && voiced
+diarize use sortformer-v2.1`. Every segment gains a `speaker` field
+(`"SPEAKER_00"`, `"SPEAKER_01"`, …); the rest of the response is unchanged.
+Optional `num_speakers=<n>` pins the count (sherpa); a request for more than 4
+speakers while Sortformer is active falls back to sherpa when it is installed.
+Default requests (no `diarize`) are byte-identical to upstream.
+
+Diarization is **full-file only**: speaker labels are computed over the whole
 recording, so they cannot stay consistent across separate short streaming
 requests. Send a complete recording in one request.
 

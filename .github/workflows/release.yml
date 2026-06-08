@@ -29,12 +29,18 @@ jobs:
       - name: Build binary
         run: bun run build
 
+      - name: Build diarization sidecar
+        run: |
+          cargo build --release --manifest-path sidecar/Cargo.toml
+          codesign -s - --force sidecar/target/release/voiced-diarize
+
       - name: Package
         id: pkg
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           ARCHIVE="voiced_Darwin_arm64.tar.gz"
-          tar -czf "$ARCHIVE" -C dist voiced
+          cp sidecar/target/release/voiced-diarize dist/voiced-diarize
+          tar -czf "$ARCHIVE" -C dist voiced voiced-diarize
           SHA=$(shasum -a 256 "$ARCHIVE" | awk '{print $1}')
           echo "version=$VERSION"  >> "$GITHUB_OUTPUT"
           echo "archive=$ARCHIVE"  >> "$GITHUB_OUTPUT"
@@ -77,7 +83,7 @@ jobs:
             depends_on "whisper-cpp"
 
             def install
-              bin.install "voiced"
+              bin.install "voiced", "voiced-diarize"
             end
 
             def caveats

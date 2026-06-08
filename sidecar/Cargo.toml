@@ -1,0 +1,21 @@
+[package]
+name = "voiced-diarize"
+version = "0.1.0"
+edition = "2021"
+description = "Sortformer speaker-diarization sidecar for voiced. Reads a 16 kHz mono wav, prints speaker turns."
+license = "MIT"
+
+[[bin]]
+name = "voiced-diarize"
+path = "src/main.rs"
+
+[dependencies]
+# NVIDIA Sortformer v2 diarization via ONNX Runtime (CPU). No Python.
+parakeet-rs = { version = "0.3.6", features = ["sortformer"] }
+hound = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+codegen-units = 1

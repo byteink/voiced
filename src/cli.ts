@@ -2,7 +2,10 @@ import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync
 import { join } from "node:path";
 import { PATHS, WHISPER_BIN, PORT } from "./config.ts";
 import { STT_CATALOG } from "./registry.ts";
-import { diarizeInstalled, installDiarize, diarizeDir } from "./diarize.ts";
+import {
+  installDiarize, diarizeDir, activeModel,
+  DIARIZE_CATALOG, modelInstalled, addDiarizeModel, useDiarizeModel, removeDiarizeModel,
+} from "./diarize.ts";
 
 function human(bytes: number): string {
   const units = ["B", "KB", "MB", "GB"];
@@ -95,19 +98,66 @@ export function cmdRm(name: string): void {
   console.log("reload: voiced restart");
 }
 
-export async function cmdDiarize(sub: string | undefined): Promise<void> {
+function cmdDiarizeLs(): void {
+  const active = activeModel();
+  console.log("Diarization models (✓ installed, ● active):");
+  for (const m of DIARIZE_CATALOG) {
+    const installed = modelInstalled(m.key);
+    let mark = " ";
+    if (m.key === active) mark = "●";
+    else if (installed) mark = "✓";
+    const cap = m.maxSpeakers === null ? "any spk" : `≤${m.maxSpeakers} spk`;
+    console.log(`  ${mark} ${m.key.padEnd(18)} ${m.size.padStart(8)}  ${cap.padEnd(8)} ${m.desc}`);
+  }
+  console.log("\n  add:  voiced diarize add <name>");
+  console.log("  use:  voiced diarize use <name>");
+}
+
+export async function cmdDiarize(args: string[]): Promise<void> {
+  const [sub, name] = args;
+
+  if (sub === "ls") { cmdDiarizeLs(); return; }
+
+  if (sub === "add") {
+    if (!name) { console.error("usage: voiced diarize add <name>"); process.exit(2); }
+    await addDiarizeModel(name);
+    console.log(`installed: ${name}`);
+    console.log(`select it with: voiced diarize use ${name}`);
+    console.log("then reload: voiced restart");
+    return;
+  }
+
+  if (sub === "use") {
+    if (!name) { console.error("usage: voiced diarize use <name>"); process.exit(2); }
+    useDiarizeModel(name);
+    console.log(`active diarization model: ${name}`);
+    console.log("reload: voiced restart");
+    return;
+  }
+
+  if (sub === "rm") {
+    if (!name) { console.error("usage: voiced diarize rm <name>"); process.exit(2); }
+    removeDiarizeModel(name);
+    console.log(`removed: ${name}`);
+    console.log("reload: voiced restart");
+    return;
+  }
+
   if (sub === "install") {
     await installDiarize();
     console.log("enable per request with: diarize=true (full-file mode, response_format=verbose_json)");
     return;
   }
+
   if (sub === undefined || sub === "status") {
-    console.log(diarizeInstalled()
-      ? `installed: ${diarizeDir()}`
-      : "not installed — run: voiced diarize install");
+    const active = activeModel();
+    console.log(active
+      ? `active: ${active}  (dir: ${diarizeDir()})`
+      : "no diarization model installed — run: voiced diarize ls");
     return;
   }
-  console.error("usage: voiced diarize [install|status]");
+
+  console.error("usage: voiced diarize [ls|add <name>|use <name>|rm <name>|install|status]");
   process.exit(2);
 }
 
@@ -169,7 +219,9 @@ export async function cmdDoctor(): Promise<void> {
   for (const c of checks) {
     console.log(`  ${c.ok ? "✓" : "✗"} ${col(c.name, 20)} ${c.detail}`);
   }
-  console.log(`  • ${col("diarization", 20)} ${diarizeInstalled() ? "installed" : "not installed (optional) — voiced diarize install"}`);
+  const active = activeModel();
+  const diarLine = active ? `active: ${active}` : "none (optional) — voiced diarize ls";
+  console.log(`  • ${col("diarization", 20)} ${diarLine}`);
   const allOk = checks.every((c) => c.ok);
   process.exit(allOk ? 0 : 1);
 }
@@ -318,8 +370,12 @@ Usage:
   voiced ls                List installed + available models
   voiced add <name>        Download a model from the catalogue
   voiced rm <name>         Delete an installed model
-  voiced diarize install   Add speaker-diarization support (~57 MB, opt-in)
-  voiced diarize status    Show diarization install status
+
+  voiced diarize ls        List diarization models (sortformer / sherpa)
+  voiced diarize add <name>  Download a diarization model
+  voiced diarize use <name>  Select the active diarization model
+  voiced diarize rm <name>   Remove a diarization model
+  voiced diarize status    Show the active diarization model
   voiced doctor            Check system health (paths, binaries, endpoint)
 
   voiced serve             Run the HTTP server in foreground (launchd uses this)

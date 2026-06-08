@@ -40,7 +40,7 @@ switch (cmd) {
     cmdRm(rest[0]);
     break;
   case "diarize":
-    await cmdDiarize(rest[0]);
+    await cmdDiarize(rest);
     break;
   case "doctor":
     await cmdDoctor();
