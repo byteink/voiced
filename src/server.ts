@@ -82,6 +82,21 @@ function jsonError(status: number, code: string, message: string) {
   );
 }
 
+// A rejection caused by the client going away. fetch reports this as a
+// DOMException in some runtimes and a plain Error in others, so match on the
+// name (the stable contract), never on the class.
+function isAbort(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { name?: string }).name === "AbortError";
+}
+
+// The client closed the connection mid-request. The response is discarded by the
+// runtime, so the body is irrelevant; 499 (nginx "Client Closed Request") only
+// records intent for our own logs. `reason` says which stage caught the abort.
+function clientClosed(reason: string): Response {
+  log("cancelled", { reason });
+  return new Response(null, { status: 499 });
+}
+
 async function handleModels(): Promise<Response> {
   const data = [...children.keys()].map((id) => ({
     id, object: "model", created: 0, owned_by: "voiced",
@@ -96,7 +111,17 @@ async function handleModels(): Promise<Response> {
 
 async function handleTranscribe(req: Request): Promise<Response> {
   if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
-  const inForm = await req.formData();
+  // Bun aborts this when the client disconnects; it is the single cancellation
+  // source threaded through every stage below.
+  const signal = req.signal;
+
+  let inForm: FormData;
+  try {
+    inForm = await req.formData();
+  } catch (err) {
+    if (isAbort(err)) return clientClosed("upload");
+    return jsonError(400, "invalid_form", `could not read multipart form: ${(err as Error).message}`);
+  }
   const file = inForm.get("file");
   if (!(file instanceof Blob)) return jsonError(400, "missing_file", "file is required");
 
@@ -107,8 +132,16 @@ async function handleTranscribe(req: Request): Promise<Response> {
       `model '${String(requested)}' not loaded. available: ${[...children.keys()].join(", ")}`);
   }
 
-  if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child);
+  if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child, signal);
+  return proxyTranscribe(inForm, file, child, signal);
+}
 
+// Default (non-diarize) path: proxy straight to the child whisper-server.
+// Forwarding the abort frees this handler and closes the proxy connection at
+// once. whisper.cpp's current decode on the shared server still runs to the end
+// — cpp-httplib cannot interrupt an in-flight handler — so the model frees up
+// one decode later, not instantly. The subprocess paths are fully killable.
+async function proxyTranscribe(inForm: FormData, file: Blob, child: Child, signal: AbortSignal): Promise<Response> {
   const out = new FormData();
   out.append("file", file, (file as File).name ?? "audio");
   for (const key of ["language", "prompt", "temperature", "response_format"] as const) {
@@ -120,15 +153,22 @@ async function handleTranscribe(req: Request): Promise<Response> {
   const started = Date.now();
   let upstream: Response;
   try {
-    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out });
+    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out, signal });
   } catch (err) {
+    if (isAbort(err)) return clientClosed("upstream-fetch");
     return jsonError(502, "upstream_unreachable",
       `whisper-server for '${child.name}' not reachable: ${(err as Error).message}`);
   }
 
-  const ms = Date.now() - started;
-  const body = await upstream.arrayBuffer();
-  log("transcribe", { model: child.name, status: upstream.status, ms, bytes: body.byteLength });
+  let body: ArrayBuffer;
+  try {
+    body = await upstream.arrayBuffer();
+  } catch (err) {
+    if (isAbort(err)) return clientClosed("upstream-read");
+    return jsonError(502, "upstream_read_failed",
+      `reading whisper-server response failed: ${(err as Error).message}`);
+  }
+  log("transcribe", { model: child.name, status: upstream.status, ms: Date.now() - started, bytes: body.byteLength });
   return new Response(body, {
     status: upstream.status,
     headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
@@ -151,6 +191,7 @@ async function transcribeWav(
   wavPath: string,
   inForm: FormData,
   child: Child,
+  signal: AbortSignal,
 ): Promise<{ ok: true; doc: { segments?: Array<{ start: number; end: number; speaker?: string }> } } | { ok: false; res: Response }> {
   const out = new FormData();
   out.append("file", Bun.file(wavPath), "audio.wav");
@@ -162,8 +203,9 @@ async function transcribeWav(
 
   let upstream: Response;
   try {
-    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out });
+    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out, signal });
   } catch (err) {
+    if (isAbort(err)) throw err; // unwound centrally by transcribeWithDiarization
     return { ok: false, res: jsonError(502, "upstream_unreachable",
       `whisper-server for '${child.name}' not reachable: ${(err as Error).message}`) };
   }
@@ -177,10 +219,34 @@ async function transcribeWav(
   return { ok: true, doc: await upstream.json() };
 }
 
+// Decode arbitrary input audio to 16 kHz mono PCM wav — sherpa requires it and
+// whisper-server accepts it directly. ffmpeg is killed on disconnect so a
+// cancelled decode reclaims CPU at once. Returns null on success, otherwise a
+// ready error Response (including the client-cancelled case).
+async function decodeToWav(inPath: string, wavPath: string, signal: AbortSignal): Promise<Response | null> {
+  const ff = spawn({
+    cmd: ["ffmpeg", "-y", "-i", inPath, "-ar", "16000", "-ac", "1", "-f", "wav", wavPath],
+    stdout: "ignore", stderr: "pipe",
+  });
+  const killFf = () => { try { ff.kill("SIGKILL"); } catch {} };
+  signal.addEventListener("abort", killFf, { once: true });
+  try {
+    await ff.exited;
+  } finally {
+    signal.removeEventListener("abort", killFf);
+  }
+  if (signal.aborted) return clientClosed("ffmpeg");
+  if (ff.exitCode !== 0) {
+    const err = (await new Response(ff.stderr).text()).trim().split("\n").at(-1) ?? "unknown";
+    return jsonError(400, "audio_decode_failed", `ffmpeg could not decode audio: ${err}`);
+  }
+  return null;
+}
+
 // diarize=true path: normalise audio once, transcribe and diarize the same wav,
 // then tag each verbose_json segment with the overlapping speaker. The default
 // (no diarize) path above is untouched and byte-identical to upstream.
-async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Child): Promise<Response> {
+async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Child, signal: AbortSignal): Promise<Response> {
   if (!diarizeInstalled()) {
     return jsonError(503, "diarization_unavailable", "diarization not installed. run: voiced diarize install");
   }
@@ -195,22 +261,18 @@ async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Ch
   const wavPath = `/tmp/voiced-${id}.wav`;
   const started = Date.now();
   try {
+    if (signal.aborted) return clientClosed("diarize-start");
     await Bun.write(inPath, file);
 
-    // sherpa requires 16 kHz mono PCM; whisper-server accepts it directly.
-    const ff = spawn({
-      cmd: ["ffmpeg", "-y", "-i", inPath, "-ar", "16000", "-ac", "1", "-f", "wav", wavPath],
-      stdout: "ignore", stderr: "pipe",
-    });
-    await ff.exited;
-    if (ff.exitCode !== 0) {
-      const err = (await new Response(ff.stderr).text()).trim().split("\n").at(-1) ?? "unknown";
-      return jsonError(400, "audio_decode_failed", `ffmpeg could not decode audio: ${err}`);
-    }
+    const decodeErr = await decodeToWav(inPath, wavPath, signal);
+    if (decodeErr) return decodeErr;
 
+    // Both stages take the abort: the diarizer subprocess is killed outright; the
+    // whisper proxy connection is torn down (its shared decode finishes upstream).
+    // A rejection from either unwinds to the abort branch of the catch below.
     const [whisper, ranges] = await Promise.all([
-      transcribeWav(wavPath, inForm, child),
-      runDiarization(wavPath, { numSpeakers }),
+      transcribeWav(wavPath, inForm, child, signal),
+      runDiarization(wavPath, { numSpeakers, signal }),
     ]);
     if (!whisper.ok) return whisper.res;
 
@@ -227,6 +289,7 @@ async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Ch
     });
     return Response.json(doc);
   } catch (err) {
+    if (isAbort(err)) return clientClosed("diarize");
     return jsonError(502, "diarization_failed", (err as Error).message);
   } finally {
     for (const p of [inPath, wavPath]) { try { unlinkSync(p); } catch {} }

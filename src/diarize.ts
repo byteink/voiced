@@ -247,9 +247,25 @@ export function parseDiarization(stdout: string): SpeakerRange[] {
   return out;
 }
 
-async function spawnParse(cmd: string[], engine: string): Promise<SpeakerRange[]> {
+// A rejection used to unwind a diarization request when the client has gone
+// away. The server matches aborts by name, not class, so a plain Error is fine.
+function abortError(): Error {
+  const e = new Error("aborted");
+  e.name = "AbortError";
+  return e;
+}
+
+async function spawnParse(cmd: string[], engine: string, signal?: AbortSignal): Promise<SpeakerRange[]> {
+  if (signal?.aborted) throw abortError();
   const p = spawn({ cmd, stdout: "pipe", stderr: "pipe" });
-  await p.exited;
+  const kill = () => { try { p.kill("SIGKILL"); } catch {} };
+  signal?.addEventListener("abort", kill, { once: true });
+  try {
+    await p.exited;
+  } finally {
+    signal?.removeEventListener("abort", kill);
+  }
+  if (signal?.aborted) throw abortError();
   if (p.exitCode !== 0) {
     const err = (await new Response(p.stderr).text()).trim().split("\n").slice(-3).join(" ");
     throw new Error(`${engine} diarizer failed (${p.exitCode}): ${err}`);
@@ -257,7 +273,7 @@ async function spawnParse(cmd: string[], engine: string): Promise<SpeakerRange[]
   return parseDiarization(await new Response(p.stdout).text());
 }
 
-function runSherpa(wavPath: string, numSpeakers?: number): Promise<SpeakerRange[]> {
+function runSherpa(wavPath: string, numSpeakers?: number, signal?: AbortSignal): Promise<SpeakerRange[]> {
   const cmd = [
     SHERPA.bin,
     `--segmentation.pyannote-model=${SHERPA.segmentation}`,
@@ -266,28 +282,30 @@ function runSherpa(wavPath: string, numSpeakers?: number): Promise<SpeakerRange[
   if (numSpeakers && numSpeakers > 0) cmd.push(`--clustering.num-clusters=${numSpeakers}`);
   else cmd.push(`--clustering.cluster-threshold=${THRESHOLD}`);
   cmd.push(wavPath);
-  return spawnParse(cmd, "sherpa");
+  return spawnParse(cmd, "sherpa", signal);
 }
 
-function runSortformer(wavPath: string, key: string): Promise<SpeakerRange[]> {
+function runSortformer(wavPath: string, key: string, signal?: AbortSignal): Promise<SpeakerRange[]> {
   const bin = sortformerBin();
   if (!bin) throw new Error("voiced-diarize sidecar not found");
-  return spawnParse([bin, join(MODELS, SORTFORMER[key].file), wavPath], "sortformer");
+  return spawnParse([bin, join(MODELS, SORTFORMER[key].file), wavPath], "sortformer", signal);
 }
 
 // Dispatch to the active engine. Sortformer caps at 4 speakers, so a request
 // that explicitly needs more falls back to sherpa when it is installed.
 export async function runDiarization(
   wavPath: string,
-  opts: { numSpeakers?: number } = {},
+  opts: { numSpeakers?: number; signal?: AbortSignal } = {},
 ): Promise<SpeakerRange[]> {
   const active = activeModel();
   if (!active) throw new Error("no diarization model installed — run: voiced diarize add <name>");
   const info = DIARIZE_CATALOG.find((m) => m.key === active)!;
   if (info.engine === "sortformer" && opts.numSpeakers && opts.numSpeakers > 4 && sherpaInstalled()) {
-    return runSherpa(wavPath, opts.numSpeakers);
+    return runSherpa(wavPath, opts.numSpeakers, opts.signal);
   }
-  return info.engine === "sortformer" ? runSortformer(wavPath, active) : runSherpa(wavPath, opts.numSpeakers);
+  return info.engine === "sortformer"
+    ? runSortformer(wavPath, active, opts.signal)
+    : runSherpa(wavPath, opts.numSpeakers, opts.signal);
 }
 
 // Assign a speaker to a transcript segment by maximum temporal overlap, falling
