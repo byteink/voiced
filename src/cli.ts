@@ -1,6 +1,7 @@
-import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync, realpathSync } from "node:fs";
+import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { PATHS, WHISPER_BIN, PORT, VERSION } from "./config.ts";
+import { LOG_FILE, ERR_FILE, pretty, atLevel, type Level } from "./logger.ts";
 import { STT_CATALOG } from "./registry.ts";
 import {
   installDiarize, diarizeDir, activeModel,
@@ -357,6 +358,82 @@ export async function cmdStatus(): Promise<void> {
   console.log(`health:  ${ep.ok ? "ok" : "down"} — ${ep.detail}`);
 }
 
+type LogOpts = { follow: boolean; json: boolean; file: string; lines: number; level: Level | null };
+
+function parseLogArgs(args: string[]): LogOpts {
+  const o: LogOpts = { follow: false, json: false, file: LOG_FILE, lines: 100, level: null };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-f" || a === "--follow") o.follow = true;
+    else if (a === "--json") o.json = true;
+    else if (a === "--err") o.file = ERR_FILE;
+    else if (a === "-l" || a === "-n" || a === "--lines") {
+      const n = Number(args[++i]);
+      if (!Number.isFinite(n) || n <= 0) { console.error("usage: voiced log -l <positive number>"); process.exit(2); }
+      o.lines = Math.floor(n);
+    } else if (a === "--level") {
+      const v = args[++i];
+      if (v !== "info" && v !== "warn" && v !== "error") { console.error("usage: voiced log --level info|warn|error"); process.exit(2); }
+      o.level = v;
+    } else { console.error(`unknown log option: ${a}`); process.exit(2); }
+  }
+  return o;
+}
+
+// Last `n` lines across the active file and any rotated siblings (.1, .2, …),
+// oldest-first. Only the structured log rotates, so the err log yields one file.
+function tailFiles(file: string, n: number): string[] {
+  const files = [file];
+  for (let i = 1; i <= 1000 && existsSync(`${file}.${i}`); i++) files.push(`${file}.${i}`);
+  let need = n;
+  const chunks: string[][] = [];
+  for (const f of files) {
+    if (need <= 0) break;
+    const all = readFileSync(f, "utf8").split("\n").filter((l) => l.length > 0);
+    const take = all.slice(Math.max(0, all.length - need));
+    chunks.unshift(take);
+    need -= take.length;
+  }
+  return chunks.flat();
+}
+
+// Follow via `tail -F`: it is battle-tested for rotation, truncation and partial
+// lines — we only pretty-print its output. Loop ends when tail is killed.
+async function followLog(o: LogOpts, render: (raw: string) => string | null): Promise<void> {
+  const proc = Bun.spawn(["tail", "-n", String(o.lines), "-F", o.file], { stdout: "pipe", stderr: "ignore" });
+  const stop = () => { try { proc.kill(); } catch {} process.exit(0); };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  const decoder = new TextDecoder();
+  let buf = "";
+  for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+    buf += decoder.decode(chunk, { stream: true });
+    const parts = buf.split("\n");
+    buf = parts.pop() ?? "";
+    for (const line of parts) {
+      if (line.length === 0) continue;
+      const out = render(line);
+      if (out !== null) console.log(out);
+    }
+  }
+}
+
+export async function cmdLog(args: string[]): Promise<void> {
+  const o = parseLogArgs(args);
+  const render = (raw: string): string | null => {
+    if (o.level && !atLevel(raw, o.level)) return null;
+    return o.json ? raw : pretty(raw);
+  };
+
+  if (o.follow) { await followLog(o, render); return; }
+
+  if (!existsSync(o.file)) { console.error(`no log file yet: ${o.file}`); return; }
+  for (const raw of tailFiles(o.file, o.lines)) {
+    const out = render(raw);
+    if (out !== null) console.log(out);
+  }
+}
+
 export function cmdHelp(): void {
   console.log(`voiced ${VERSION} — OpenAI-compatible local STT gateway
 
@@ -367,6 +444,7 @@ Usage:
   voiced start             Load the launchd agent
   voiced stop              Unload the launchd agent
   voiced restart           Restart the launchd agent
+  voiced log [-f] [-l N]   Show logs (-f follow, -l lines, --json, --level, --err)
 
   voiced ls                List installed + available models
   voiced add <name>        Download a model from the catalogue
@@ -383,6 +461,6 @@ Usage:
 
 Data dir: ${PATHS.home}
 Endpoint: http://127.0.0.1:${PORT}
-Logs:     ${PATHS.logs}/voiced.{out,err}.log
+Logs:     voiced log  (raw: ${PATHS.logs}/voiced.log)
 `);
 }

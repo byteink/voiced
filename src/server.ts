@@ -5,19 +5,16 @@ import { readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync, unlink
 import { join } from "node:path";
 import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES } from "./config.ts";
 import { diarizeInstalled, runDiarization, speakerForSegment } from "./diarize.ts";
+import { log } from "./logger.ts";
 
 type Child = { name: string; port: number; path: string; proc: Subprocess };
 
+// Per-request log context: a short id shared by the request's req.start/req.end
+// lines, plus fields the handler enriches (model, bytes, cancellation, …).
+type ReqCtx = { id: string; fields: Record<string, unknown> };
+
 const children = new Map<string, Child>();
 let shuttingDown = false;
-
-function now() {
-  return new Date().toISOString();
-}
-
-function log(event: string, extra: Record<string, unknown> = {}) {
-  console.log(JSON.stringify({ t: now(), event, ...extra }));
-}
 
 function discoverSttModels(): Array<{ name: string; path: string }> {
   if (!existsSync(PATHS.stt)) return [];
@@ -90,10 +87,10 @@ function isAbort(err: unknown): boolean {
 }
 
 // The client closed the connection mid-request. The response is discarded by the
-// runtime, so the body is irrelevant; 499 (nginx "Client Closed Request") only
-// records intent for our own logs. `reason` says which stage caught the abort.
-function clientClosed(reason: string): Response {
-  log("cancelled", { reason });
+// runtime, so the body is irrelevant; 499 (nginx "Client Closed Request") flows
+// through to the req.end access line. `reason` records which stage caught it.
+function clientClosed(ctx: ReqCtx, reason: string): Response {
+  ctx.fields.cancelled = reason;
   return new Response(null, { status: 499 });
 }
 
@@ -109,7 +106,7 @@ async function handleModels(): Promise<Response> {
   return Response.json({ object: "list", data });
 }
 
-async function handleTranscribe(req: Request): Promise<Response> {
+async function handleTranscribe(req: Request, ctx: ReqCtx): Promise<Response> {
   if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
   // Bun aborts this when the client disconnects; it is the single cancellation
   // source threaded through every stage below.
@@ -119,7 +116,7 @@ async function handleTranscribe(req: Request): Promise<Response> {
   try {
     inForm = await req.formData();
   } catch (err) {
-    if (isAbort(err)) return clientClosed("upload");
+    if (isAbort(err)) return clientClosed(ctx, "upload");
     return jsonError(400, "invalid_form", `could not read multipart form: ${(err as Error).message}`);
   }
   const file = inForm.get("file");
@@ -132,8 +129,8 @@ async function handleTranscribe(req: Request): Promise<Response> {
       `model '${String(requested)}' not loaded. available: ${[...children.keys()].join(", ")}`);
   }
 
-  if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child, signal);
-  return proxyTranscribe(inForm, file, child, signal);
+  if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child, signal, ctx);
+  return proxyTranscribe(inForm, file, child, signal, ctx);
 }
 
 // Default (non-diarize) path: proxy straight to the child whisper-server.
@@ -141,7 +138,7 @@ async function handleTranscribe(req: Request): Promise<Response> {
 // once. whisper.cpp's current decode on the shared server still runs to the end
 // — cpp-httplib cannot interrupt an in-flight handler — so the model frees up
 // one decode later, not instantly. The subprocess paths are fully killable.
-async function proxyTranscribe(inForm: FormData, file: Blob, child: Child, signal: AbortSignal): Promise<Response> {
+async function proxyTranscribe(inForm: FormData, file: Blob, child: Child, signal: AbortSignal, ctx: ReqCtx): Promise<Response> {
   const out = new FormData();
   out.append("file", file, (file as File).name ?? "audio");
   for (const key of ["language", "prompt", "temperature", "response_format"] as const) {
@@ -150,12 +147,11 @@ async function proxyTranscribe(inForm: FormData, file: Blob, child: Child, signa
   }
   if (!inForm.has("response_format")) out.append("response_format", "json");
 
-  const started = Date.now();
   let upstream: Response;
   try {
     upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out, signal });
   } catch (err) {
-    if (isAbort(err)) return clientClosed("upstream-fetch");
+    if (isAbort(err)) return clientClosed(ctx, "upstream-fetch");
     return jsonError(502, "upstream_unreachable",
       `whisper-server for '${child.name}' not reachable: ${(err as Error).message}`);
   }
@@ -164,11 +160,13 @@ async function proxyTranscribe(inForm: FormData, file: Blob, child: Child, signa
   try {
     body = await upstream.arrayBuffer();
   } catch (err) {
-    if (isAbort(err)) return clientClosed("upstream-read");
+    if (isAbort(err)) return clientClosed(ctx, "upstream-read");
     return jsonError(502, "upstream_read_failed",
       `reading whisper-server response failed: ${(err as Error).message}`);
   }
-  log("transcribe", { model: child.name, status: upstream.status, ms: Date.now() - started, bytes: body.byteLength });
+  ctx.fields.model = child.name;
+  ctx.fields.bytes = body.byteLength;
+  ctx.fields.diarize = false;
   return new Response(body, {
     status: upstream.status,
     headers: { "content-type": upstream.headers.get("content-type") ?? "application/json" },
@@ -223,7 +221,7 @@ async function transcribeWav(
 // whisper-server accepts it directly. ffmpeg is killed on disconnect so a
 // cancelled decode reclaims CPU at once. Returns null on success, otherwise a
 // ready error Response (including the client-cancelled case).
-async function decodeToWav(inPath: string, wavPath: string, signal: AbortSignal): Promise<Response | null> {
+async function decodeToWav(inPath: string, wavPath: string, signal: AbortSignal, ctx: ReqCtx): Promise<Response | null> {
   const ff = spawn({
     cmd: ["ffmpeg", "-y", "-i", inPath, "-ar", "16000", "-ac", "1", "-f", "wav", wavPath],
     stdout: "ignore", stderr: "pipe",
@@ -235,7 +233,7 @@ async function decodeToWav(inPath: string, wavPath: string, signal: AbortSignal)
   } finally {
     signal.removeEventListener("abort", killFf);
   }
-  if (signal.aborted) return clientClosed("ffmpeg");
+  if (signal.aborted) return clientClosed(ctx, "ffmpeg");
   if (ff.exitCode !== 0) {
     const err = (await new Response(ff.stderr).text()).trim().split("\n").at(-1) ?? "unknown";
     return jsonError(400, "audio_decode_failed", `ffmpeg could not decode audio: ${err}`);
@@ -246,7 +244,7 @@ async function decodeToWav(inPath: string, wavPath: string, signal: AbortSignal)
 // diarize=true path: normalise audio once, transcribe and diarize the same wav,
 // then tag each verbose_json segment with the overlapping speaker. The default
 // (no diarize) path above is untouched and byte-identical to upstream.
-async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Child, signal: AbortSignal): Promise<Response> {
+async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Child, signal: AbortSignal, ctx: ReqCtx): Promise<Response> {
   if (!diarizeInstalled()) {
     return jsonError(503, "diarization_unavailable", "diarization not installed. run: voiced diarize install");
   }
@@ -256,15 +254,14 @@ async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Ch
   }
   const numSpeakers = parsePositiveInt(inForm.get("num_speakers"));
 
-  const id = crypto.randomUUID();
-  const inPath = `/tmp/voiced-${id}.in`;
-  const wavPath = `/tmp/voiced-${id}.wav`;
-  const started = Date.now();
+  const tmp = crypto.randomUUID();
+  const inPath = `/tmp/voiced-${tmp}.in`;
+  const wavPath = `/tmp/voiced-${tmp}.wav`;
   try {
-    if (signal.aborted) return clientClosed("diarize-start");
+    if (signal.aborted) return clientClosed(ctx, "diarize-start");
     await Bun.write(inPath, file);
 
-    const decodeErr = await decodeToWav(inPath, wavPath, signal);
+    const decodeErr = await decodeToWav(inPath, wavPath, signal, ctx);
     if (decodeErr) return decodeErr;
 
     // Both stages take the abort: the diarizer subprocess is killed outright; the
@@ -282,14 +279,13 @@ async function transcribeWithDiarization(inForm: FormData, file: Blob, child: Ch
         seg.speaker = speakerForSegment(seg.start, seg.end, ranges) ?? "SPEAKER_00";
       }
     }
-    const speakers = new Set(ranges.map((r) => r.speaker)).size;
-    log("transcribe+diarize", {
-      model: child.name, segments: doc.segments?.length ?? 0, speakers,
-      ms: Date.now() - started,
-    });
+    ctx.fields.model = child.name;
+    ctx.fields.segments = doc.segments?.length ?? 0;
+    ctx.fields.speakers = new Set(ranges.map((r) => r.speaker)).size;
+    ctx.fields.diarize = true;
     return Response.json(doc);
   } catch (err) {
-    if (isAbort(err)) return clientClosed("diarize");
+    if (isAbort(err)) return clientClosed(ctx, "diarize");
     return jsonError(502, "diarization_failed", (err as Error).message);
   } finally {
     for (const p of [inPath, wavPath]) { try { unlinkSync(p); } catch {} }
@@ -356,6 +352,24 @@ function shutdown() {
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
 
+function levelFor(status: number): "info" | "warn" | "error" {
+  if (status >= 500) return "error";
+  if (status >= 400) return "warn";
+  return "info";
+}
+
+// Pure dispatch: every branch returns a Response so the access-log wrapper can
+// time and record it uniformly. 499 (client cancel) is produced inside the
+// handlers via clientClosed and flows through here untouched.
+function route(req: Request, url: URL, ctx: ReqCtx): Promise<Response> | Response {
+  if (url.pathname === "/health") return handleHealth();
+  if (url.pathname === "/v1/models") return handleModels();
+  if (url.pathname === "/v1/audio/transcriptions") return handleTranscribe(req, ctx);
+  if (url.pathname === "/v1/audio/speech") return handleSpeechStub();
+  if (url.pathname === "/") return new Response("voiced\n");
+  return jsonError(404, "not_found", `no route for ${url.pathname}`);
+}
+
 export async function runServer(): Promise<void> {
   if (!existsSync(PATHS.home)) mkdirSync(PATHS.home, { recursive: true });
   if (!existsSync(PATHS.logs)) mkdirSync(PATHS.logs, { recursive: true });
@@ -379,14 +393,14 @@ export async function runServer(): Promise<void> {
       port: PORT,
       hostname: "0.0.0.0",
       idleTimeout: 120,
-      async fetch(req: Request) {
+      async fetch(req: Request, server) {
+        const ctx: ReqCtx = { id: crypto.randomUUID().slice(0, 8), fields: {} };
         const url = new URL(req.url);
-        if (url.pathname === "/health") return handleHealth();
-        if (url.pathname === "/v1/models") return handleModels();
-        if (url.pathname === "/v1/audio/transcriptions") return handleTranscribe(req);
-        if (url.pathname === "/v1/audio/speech") return handleSpeechStub();
-        if (url.pathname === "/") return new Response("voiced\n");
-        return jsonError(404, "not_found", `no route for ${url.pathname}`);
+        log("req.start", { id: ctx.id, method: req.method, path: url.pathname, ip: server.requestIP(req)?.address });
+        const started = Date.now();
+        const res = await route(req, url, ctx);
+        log("req.end", { id: ctx.id, status: res.status, ms: Date.now() - started, ...ctx.fields }, levelFor(res.status));
+        return res;
       },
     });
   } catch (err) {

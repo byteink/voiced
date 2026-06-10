@@ -2,7 +2,7 @@ import { runServer } from "./server.ts";
 import { VERSION } from "./config.ts";
 import {
   cmdLs, cmdAdd, cmdRm, cmdDoctor, cmdHelp,
-  cmdStart, cmdStop, cmdRestart, cmdStatus, cmdDiarize,
+  cmdStart, cmdStop, cmdRestart, cmdStatus, cmdDiarize, cmdLog,
 } from "./cli.ts";
 
 const [, , cmd, ...rest] = process.argv;
@@ -47,6 +47,9 @@ switch (cmd) {
     break;
   case "diarize":
     await cmdDiarize(rest);
+    break;
+  case "log":
+    await cmdLog(rest);
     break;
   case "doctor":
     await cmdDoctor();
