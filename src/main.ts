@@ -2,7 +2,7 @@ import { runServer } from "./server.ts";
 import { VERSION } from "./config.ts";
 import {
   cmdLs, cmdAdd, cmdRm, cmdDoctor, cmdHelp,
-  cmdStart, cmdStop, cmdRestart, cmdStatus, cmdDiarize, cmdLog,
+  cmdStart, cmdStop, cmdRestart, cmdStatus, cmdDiarize, cmdLog, cmdLimit, cmdReload,
 } from "./cli.ts";
 
 const [, , cmd, ...rest] = process.argv;
@@ -43,7 +43,13 @@ switch (cmd) {
     break;
   case "rm":
     if (!rest[0]) { console.error("usage: voiced rm <name>"); process.exit(2); }
-    cmdRm(rest[0]);
+    await cmdRm(rest[0]);
+    break;
+  case "limit":
+    await cmdLimit(rest);
+    break;
+  case "reload":
+    await cmdReload();
     break;
   case "diarize":
     await cmdDiarize(rest);

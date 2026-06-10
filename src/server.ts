@@ -6,13 +6,14 @@ import { join } from "node:path";
 import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES } from "./config.ts";
 import { diarizeInstalled, runDiarization, speakerForSegment } from "./diarize.ts";
 import { log } from "./logger.ts";
-import { withGate, gateStatus } from "./gate.ts";
+import { withGate, gateStatus, setLimit } from "./gate.ts";
 
 type Child = { name: string; port: number; path: string; proc: Subprocess };
 
 // Per-request log context: a short id shared by the request's req.start/req.end
 // lines, plus fields the handler enriches (model, bytes, cancellation, …).
-type ReqCtx = { id: string; fields: Record<string, unknown> };
+// `local` is true when the connection came from loopback — it gates /admin/*.
+type ReqCtx = { id: string; fields: Record<string, unknown>; local: boolean };
 
 const children = new Map<string, Child>();
 let shuttingDown = false;
@@ -51,7 +52,11 @@ function supervise(name: string, modelPath: string, port: number) {
   children.set(name, { name, port, path: modelPath, proc });
   proc.exited.then((code: number | null) => {
     log("child-exit", { name, code });
-    if (!shuttingDown) setTimeout(() => supervise(name, modelPath, port), 2000);
+    // Respawn only a genuine crash: if the child was intentionally removed (or
+    // replaced) its map entry is gone or holds a different proc, so we stop.
+    if (!shuttingDown && children.get(name)?.proc === proc) {
+      setTimeout(() => supervise(name, modelPath, port), 2000);
+    }
   });
 }
 
@@ -59,6 +64,43 @@ function resolveModel(requested: string | null): Child | null {
   if (!requested) return children.values().next().value ?? null;
   const name = STT_ALIASES[requested] ?? requested;
   return children.get(name) ?? null;
+}
+
+// Lowest port at/above BASE_PORT not already taken by a child. Bounded by the
+// number of children.
+function nextFreePort(): number {
+  const used = new Set([...children.values()].map((c) => c.port));
+  let p = BASE_PORT;
+  while (used.has(p)) p++;
+  return p;
+}
+
+// Converge the running children to the models on disk: supervise any newly
+// added model, stop any whose file is gone. New children load in the
+// background (/health reflects readiness). The sole mutator of child lifecycle
+// outside boot/shutdown — `voiced add`/`rm` reach it via POST /admin/reload, so
+// models change without a restart.
+function reloadModels(): { added: string[]; removed: string[]; models: string[] } {
+  const found = discoverSttModels();
+  const names = new Set(found.map((m) => m.name));
+  const added: string[] = [];
+  const removed: string[] = [];
+  for (const m of found) {
+    if (children.has(m.name)) continue;
+    supervise(m.name, m.path, nextFreePort());
+    added.push(m.name);
+  }
+  // Snapshot before mutating: deleting from the live map mid-iteration skips
+  // entries.
+  const gone = [...children.keys()].filter((name) => !names.has(name));
+  for (const name of gone) {
+    const c = children.get(name)!;
+    children.delete(name);              // delete first: the respawn guard then stops
+    try { c.proc.kill("SIGTERM"); } catch {}
+    removed.push(name);
+  }
+  if (added.length || removed.length) log("reload", { added, removed });
+  return { added, removed, models: [...children.keys()] };
 }
 
 async function waitReady(port: number, deadlineMs: number): Promise<boolean> {
@@ -314,6 +356,40 @@ function handleSpeechStub(): Response {
   return jsonError(501, "not_implemented", "TTS (/v1/audio/speech) not yet available");
 }
 
+// /admin/* mutate server state (limit, model children). The server binds
+// 0.0.0.0, so these are restricted to loopback — an off-host caller cannot forge
+// a 127.0.0.1 source address over TCP. Returns the rejection or null to proceed.
+function requireLocal(ctx: ReqCtx): Response | null {
+  return ctx.local ? null : jsonError(403, "forbidden", "admin endpoints are loopback-only");
+}
+
+// GET: current limit + in-flight. POST {value:N}: set the live limit (no
+// restart) and persist it.
+async function handleAdminLimit(req: Request, ctx: ReqCtx): Promise<Response> {
+  const denied = requireLocal(ctx);
+  if (denied) return denied;
+  if (req.method === "GET") return Response.json(gateStatus());
+  if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use GET or POST");
+  const body = (await req.json().catch(() => null)) as { value?: unknown } | null;
+  const n = typeof body?.value === "number" ? body.value : Number.NaN;
+  if (!Number.isInteger(n) || n <= 0) return jsonError(400, "invalid_limit", "value must be a positive integer");
+  setLimit(n);
+  ctx.fields.limit = n;
+  return Response.json(gateStatus());
+}
+
+// POST: rescan the models dir and converge running children — load added
+// models, drop removed ones — without a restart.
+function handleAdminReload(req: Request, ctx: ReqCtx): Response {
+  const denied = requireLocal(ctx);
+  if (denied) return denied;
+  if (req.method !== "POST") return jsonError(405, "method_not_allowed", "use POST");
+  const r = reloadModels();
+  ctx.fields.added = r.added.length;
+  ctx.fields.removed = r.removed.length;
+  return Response.json(r);
+}
+
 const LOCK_FILE = join(PATHS.home, "voiced.pid");
 
 function pidAlive(pid: number): boolean {
@@ -367,6 +443,8 @@ function route(req: Request, url: URL, ctx: ReqCtx): Promise<Response> | Respons
   if (url.pathname === "/v1/models") return handleModels();
   if (url.pathname === "/v1/audio/transcriptions") return withGate(() => handleTranscribe(req, ctx));
   if (url.pathname === "/v1/audio/speech") return handleSpeechStub();
+  if (url.pathname === "/admin/limit") return handleAdminLimit(req, ctx);
+  if (url.pathname === "/admin/reload") return handleAdminReload(req, ctx);
   if (url.pathname === "/") return new Response("voiced\n");
   return jsonError(404, "not_found", `no route for ${url.pathname}`);
 }
@@ -395,9 +473,10 @@ export async function runServer(): Promise<void> {
       hostname: "0.0.0.0",
       idleTimeout: 120,
       async fetch(req: Request, server) {
-        const ctx: ReqCtx = { id: crypto.randomUUID().slice(0, 8), fields: {} };
+        const ip = server.requestIP(req)?.address;
+        const ctx: ReqCtx = { id: crypto.randomUUID().slice(0, 8), fields: {}, local: ip === "127.0.0.1" || ip === "::1" };
         const url = new URL(req.url);
-        log("req.start", { id: ctx.id, method: req.method, path: url.pathname, ip: server.requestIP(req)?.address });
+        log("req.start", { id: ctx.id, method: req.method, path: url.pathname, ip });
         const started = Date.now();
         const res = await route(req, url, ctx);
         log("req.end", { id: ctx.id, status: res.status, ms: Date.now() - started, ...ctx.fields }, levelFor(res.status));

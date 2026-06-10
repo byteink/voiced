@@ -2,6 +2,7 @@ import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync
 import { join } from "node:path";
 import { PATHS, WHISPER_BIN, PORT, VERSION } from "./config.ts";
 import { LOG_FILE, ERR_FILE, pretty, atLevel, type Level } from "./logger.ts";
+import { gateStatus, setLimit } from "./gate.ts";
 import { STT_CATALOG } from "./registry.ts";
 import {
   installDiarize, diarizeDir, activeModel,
@@ -46,6 +47,26 @@ export function cmdLs(): void {
   console.log("\nTTS voices: (TTS not yet implemented)");
 }
 
+function adminUrl(path: string): string {
+  return `http://127.0.0.1:${PORT}${path}`;
+}
+
+// Ask the running server to rescan models. Returns a human status, or null when
+// the server is down (the file is on disk either way; boot discovers it).
+async function triggerReload(): Promise<string | null> {
+  try {
+    const r = await fetch(adminUrl("/admin/reload"), { method: "POST", signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return `server reload failed: HTTP ${r.status}`;
+    const j = (await r.json()) as { added: string[]; removed: string[] };
+    const parts: string[] = [];
+    if (j.added.length) parts.push(`+${j.added.join(", ")}`);
+    if (j.removed.length) parts.push(`-${j.removed.join(", ")}`);
+    return parts.length ? `loaded live (${parts.join("  ")})` : "loaded live (no change)";
+  } catch {
+    return null;
+  }
+}
+
 export async function cmdAdd(name: string): Promise<void> {
   const entry = STT_CATALOG[name];
   if (!entry) {
@@ -85,10 +106,10 @@ export async function cmdAdd(name: string): Promise<void> {
   await Bun.write(dest, Bun.file(tmp));
   unlinkSync(tmp);
   console.log(`installed: ${dest}`);
-  console.log("reload the running server: voiced restart");
+  console.log(await triggerReload() ?? "voiced not running — it will load on next start");
 }
 
-export function cmdRm(name: string): void {
+export async function cmdRm(name: string): Promise<void> {
   const target = listSttFiles().find((m) => m.name === name);
   if (!target) {
     console.error(`not installed: ${name}`);
@@ -96,7 +117,7 @@ export function cmdRm(name: string): void {
   }
   unlinkSync(target.file);
   console.log(`removed: ${target.file}`);
-  console.log("reload: voiced restart");
+  console.log(await triggerReload() ?? "voiced not running — no reload needed");
 }
 
 function cmdDiarizeLs(): void {
@@ -434,6 +455,42 @@ export async function cmdLog(args: string[]): Promise<void> {
   }
 }
 
+// `voiced limit` shows it; `voiced limit N` sets it live on the running server
+// (persisted, no restart). With the server down, N is saved for the next start.
+export async function cmdLimit(args: string[]): Promise<void> {
+  const [val] = args;
+  if (val === undefined) {
+    try {
+      const r = await fetch(adminUrl("/admin/limit"), { signal: AbortSignal.timeout(2000) });
+      const s = (await r.json()) as { inFlight: number; limit: number };
+      console.log(`limit: ${s.limit}   in-flight: ${s.inFlight}`);
+    } catch {
+      console.log(`limit: ${gateStatus().limit}   (voiced not running)`);
+    }
+    return;
+  }
+  const n = Number(val);
+  if (!Number.isInteger(n) || n <= 0) { console.error("usage: voiced limit <positive integer>"); process.exit(2); }
+  try {
+    const r = await fetch(adminUrl("/admin/limit"), {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ value: n }), signal: AbortSignal.timeout(2000),
+    });
+    if (!r.ok) { console.error(`failed: HTTP ${r.status} ${(await r.text()).trim()}`); process.exit(1); }
+    const s = (await r.json()) as { limit: number };
+    console.log(`limit set to ${s.limit} (live, no restart)`);
+  } catch {
+    setLimit(n);
+    console.log(`voiced not running — limit ${n} saved; applies on next start`);
+  }
+}
+
+export async function cmdReload(): Promise<void> {
+  const status = await triggerReload();
+  if (status === null) { console.error("voiced is not running"); process.exit(1); }
+  console.log(status);
+}
+
 export function cmdHelp(): void {
   console.log(`voiced ${VERSION} — OpenAI-compatible local STT gateway
 
@@ -447,8 +504,10 @@ Usage:
   voiced log [-f] [-l N]   Show logs (-f follow, -l lines, --json, --level, --err)
 
   voiced ls                List installed + available models
-  voiced add <name>        Download a model from the catalogue
-  voiced rm <name>         Delete an installed model
+  voiced add <name>        Download a model (loads live, no restart)
+  voiced rm <name>         Delete an installed model (live)
+  voiced reload            Rescan models into the running server
+  voiced limit [N]         Show or set max concurrent requests (live)
 
   voiced diarize ls        List diarization models (sortformer / sherpa)
   voiced diarize add <name>  Download a diarization model
