@@ -1,6 +1,6 @@
 import { readdirSync, existsSync, mkdirSync, statSync, unlinkSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { PATHS, WHISPER_BIN, PORT } from "./config.ts";
+import { PATHS, WHISPER_BIN, PORT, VERSION } from "./config.ts";
 import { STT_CATALOG } from "./registry.ts";
 import {
   installDiarize, diarizeDir, activeModel,
@@ -358,10 +358,11 @@ export async function cmdStatus(): Promise<void> {
 }
 
 export function cmdHelp(): void {
-  console.log(`voiced — OpenAI-compatible local STT gateway
+  console.log(`voiced ${VERSION} — OpenAI-compatible local STT gateway
 
 Usage:
   voiced help              Show this message
+  voiced version           Print the version
   voiced status            Show launchd + health status
   voiced start             Load the launchd agent
   voiced stop              Unload the launchd agent

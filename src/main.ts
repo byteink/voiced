@@ -1,4 +1,5 @@
 import { runServer } from "./server.ts";
+import { VERSION } from "./config.ts";
 import {
   cmdLs, cmdAdd, cmdRm, cmdDoctor, cmdHelp,
   cmdStart, cmdStop, cmdRestart, cmdStatus, cmdDiarize,
@@ -12,6 +13,11 @@ switch (cmd) {
   case "-h":
   case "--help":
     cmdHelp();
+    break;
+  case "version":
+  case "-v":
+  case "--version":
+    console.log(`voiced ${VERSION}`);
     break;
   case "serve":
     await runServer();

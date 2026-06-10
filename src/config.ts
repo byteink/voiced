@@ -1,5 +1,10 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import pkg from "../package.json";
+
+// Single source of truth: bumped only by the release flow. Bun inlines this at
+// compile time, so the binary reports its own build version.
+export const VERSION: string = pkg.version;
 
 const HOME_DIR = Bun.env.VOICED_HOME ?? join(homedir(), ".voiced");
 
