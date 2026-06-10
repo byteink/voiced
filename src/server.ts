@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES } from "./config.ts";
 import { diarizeInstalled, runDiarization, speakerForSegment } from "./diarize.ts";
 import { log } from "./logger.ts";
+import { withGate, gateStatus } from "./gate.ts";
 
 type Child = { name: string; port: number; path: string; proc: Subprocess };
 
@@ -303,7 +304,7 @@ async function handleHealth(): Promise<Response> {
     }
   }));
   const ok = Object.values(upstreams).every(Boolean) && children.size > 0;
-  return new Response(JSON.stringify({ ok, upstreams }), {
+  return new Response(JSON.stringify({ ok, upstreams, ...gateStatus() }), {
     status: ok ? 200 : 503,
     headers: { "content-type": "application/json" },
   });
@@ -364,7 +365,7 @@ function levelFor(status: number): "info" | "warn" | "error" {
 function route(req: Request, url: URL, ctx: ReqCtx): Promise<Response> | Response {
   if (url.pathname === "/health") return handleHealth();
   if (url.pathname === "/v1/models") return handleModels();
-  if (url.pathname === "/v1/audio/transcriptions") return handleTranscribe(req, ctx);
+  if (url.pathname === "/v1/audio/transcriptions") return withGate(() => handleTranscribe(req, ctx));
   if (url.pathname === "/v1/audio/speech") return handleSpeechStub();
   if (url.pathname === "/") return new Response("voiced\n");
   return jsonError(404, "not_found", `no route for ${url.pathname}`);
