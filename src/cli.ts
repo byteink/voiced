@@ -332,24 +332,82 @@ function writePlist(): void {
   writeFileSync(plistPath(), plist);
 }
 
+function uid(): string {
+  return String(process.getuid?.() ?? "");
+}
+
+// launchd remembers a per-user disabled flag independently of whether the plist
+// exists, and it SURVIVES REBOOTS AND REINSTALLS. A disabled service refuses to
+// bootstrap ("Service is disabled"), so every start path clears it first --
+// otherwise `voiced disable` once means `voiced start` is broken forever with a
+// message that does not say why.
+function setEnabled(on: boolean): { code: number; out: string; err: string } {
+  return launchctl([on ? "enable" : "disable", `gui/${uid()}/${LABEL}`]);
+}
+
+// True when launchd holds the disabled flag for this label.
+function isDisabled(): boolean {
+  const r = launchctl(["print-disabled", `gui/${uid()}`]);
+  return new RegExp(`"${LABEL}"\\s*=>\\s*(disabled|true)`).test(r.out);
+}
+
+function isLoaded(): boolean {
+  return launchctl(["list"]).out.split("\n").some((l) => l.includes(LABEL));
+}
+
+function bootout(): { ok: boolean; err: string } {
+  const r = launchctl(["bootout", `gui/${uid()}/${LABEL}`]);
+  return { ok: r.code === 0 || /could not find|no such|not find/i.test(r.err), err: r.err };
+}
+
+// Run now. Leaves the start-at-login setting alone except for clearing an
+// explicit `disable`, which would otherwise make this command fail.
 export function cmdStart(): void {
   ensureDirs();
   purgeLegacyAgents();
   writePlist();
-  const r = launchctl(["bootstrap", `gui/${process.getuid?.() ?? ""}`, plistPath()]);
+  setEnabled(true);
+  const r = launchctl(["bootstrap", `gui/${uid()}`, plistPath()]);
   if (r.code === 0) { console.log("started"); return; }
   if (/already loaded|service already/i.test(r.err)) { console.log("already running"); return; }
   console.error(r.err || `bootstrap failed (${r.code})`);
   process.exit(1);
 }
 
+// Stop now, and leave it enrolled: it comes back at the next login. Use
+// `voiced disable` to stop it coming back. This deliberately no longer deletes
+// the plist -- "stop the daemon" and "never run it again" are different asks,
+// and conflating them meant there was no way to do the first one.
 export function cmdStop(): void {
-  const r = launchctl(["bootout", `gui/${process.getuid?.() ?? ""}/${LABEL}`]);
-  const ok = r.code === 0 || /could not find|no such/i.test(r.err);
-  if (existsSync(plistPath())) unlinkSync(plistPath());
-  if (ok) { console.log("stopped"); return; }
-  console.error(r.err || `bootout failed (${r.code})`);
+  const r = bootout();
+  if (r.ok) {
+    console.log(isDisabled() ? "stopped (start at login: disabled)" : "stopped (starts again at login — `voiced disable` to prevent)");
+    return;
+  }
+  console.error(r.err || "bootout failed");
   process.exit(1);
+}
+
+// Start at login, from now on. Also starts it now, so `enable` never leaves the
+// user looking at a service that is configured but not running.
+export function cmdEnable(): void {
+  ensureDirs();
+  purgeLegacyAgents();
+  writePlist();
+  const e = setEnabled(true);
+  if (e.code !== 0 && e.err) { console.error(e.err); process.exit(1); }
+  if (!isLoaded()) launchctl(["bootstrap", `gui/${uid()}`, plistPath()]);
+  console.log("enabled — starts at login, running now");
+}
+
+// Do not start at login, and stop it now. The plist stays on disk so `voiced
+// enable` restores it without reinstalling anything.
+export function cmdDisable(): void {
+  const e = setEnabled(false);
+  if (e.code !== 0 && e.err) { console.error(e.err); process.exit(1); }
+  const r = bootout();
+  if (!r.ok) { console.error(r.err || "bootout failed"); process.exit(1); }
+  console.log("disabled — stopped, and will not start at login");
 }
 
 export function cmdRestart(): void {
@@ -370,11 +428,15 @@ export function cmdRestart(): void {
 }
 
 export async function cmdStatus(): Promise<void> {
+  const atLogin = isDisabled() ? "disabled" : "enabled";
   const r = launchctl(["list"]);
   const line = r.out.split("\n").find((l) => l.includes(LABEL));
-  if (!line) { console.log("not loaded"); return; }
+  if (!line) {
+    console.log(`launchd: not loaded  (start at login: ${atLogin})`);
+    return;
+  }
   const [pid, exit] = line.split(/\s+/);
-  console.log(`launchd: pid=${pid} last_exit=${exit} label=${LABEL}`);
+  console.log(`launchd: pid=${pid} last_exit=${exit} label=${LABEL}  (start at login: ${atLogin})`);
   const ep = await checkEndpoint();
   console.log(`health:  ${ep.ok ? "ok" : "down"} — ${ep.detail}`);
 }
@@ -498,9 +560,11 @@ Usage:
   voiced help              Show this message
   voiced version           Print the version
   voiced status            Show launchd + health status
-  voiced start             Load the launchd agent
-  voiced stop              Unload the launchd agent
-  voiced restart           Restart the launchd agent
+  voiced start             Start the daemon now
+  voiced stop              Stop the daemon now (still starts at login)
+  voiced restart           Restart the daemon
+  voiced enable            Start at login (and start now)
+  voiced disable           Do not start at login (and stop now)
   voiced log [-f] [-l N]   Show logs (-f follow, -l lines, --json, --level, --err)
 
   voiced ls                List installed + available models

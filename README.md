@@ -114,9 +114,11 @@ bun run build      # → dist/voiced
 ```bash
 voiced              # show help
 voiced status      # launchd + /health status
-voiced start        # load launchd agent
-voiced stop         # unload launchd agent
+voiced start        # start the daemon now
+voiced stop         # stop it now (still starts at login)
 voiced restart      # kickstart the agent
+voiced enable       # start at login, and start now
+voiced disable      # do not start at login, and stop now
 
 voiced ls           # installed + available models
 voiced add <name>   # download from catalogue
@@ -211,6 +213,29 @@ hardcode the path don't get generic 404s.
 
 ---
 
+## Model lifecycle
+
+Models load on first use and unload after `VOICED_IDLE_MS` (5 minutes by
+default) without a request. Nothing is loaded at boot.
+
+This matters because `whisper-server` holds its entire model resident:
+`large-v3` is 2.9 GB and `large-v3-turbo` 1.5 GB, so supervising every
+installed model for the life of the daemon costs that much RAM around the
+clock for a workload that is idle almost all of it.
+
+The cost is a cold start on the first request after an idle period — the model
+is read off disk before that request is served. `/health` reports both sets:
+
+```json
+{ "ok": true, "models": ["large-v3", "large-v3-turbo"], "loaded": [] }
+```
+
+`models` is what is installed, `loaded` is what is resident right now. An empty
+`loaded` is the normal idle state, not a fault. Set `VOICED_IDLE_MS=0` to keep
+a model resident once it has been used.
+
+---
+
 ## Configuration
 
 Env vars (read at server start, written into the plist by `voiced start`):
@@ -222,6 +247,8 @@ Env vars (read at server start, written into the plist by `voiced start`):
 | `VOICED_BASE_PORT` | `2023` | First port for children |
 | `VOICED_WHISPER_BIN` | `/opt/homebrew/bin/whisper-server` | Child binary |
 | `VOICED_THREADS` | `8` | Threads per child |
+| `VOICED_IDLE_MS` | `300000` | Unload a model after this long unused (`0` = never) |
+| `VOICED_SPAWN_TIMEOUT_MS` | `120000` | How long to wait for a cold model to answer |
 
 To override, edit `~/Library/LaunchAgents/io.byteink.voiced.plist` and run
 `voiced restart`.
@@ -272,5 +299,6 @@ voiced stop
 brew uninstall voiced
 ```
 
-`voiced stop` removes the launchd plist. `~/.voiced/` is left intact —
-delete it manually if you also want the models gone.
+`voiced stop` only stops the running daemon; it comes back at the next login.
+Use `voiced disable` to stop it and keep it stopped. `~/.voiced/` is left
+intact either way — delete it manually if you also want the models gone.

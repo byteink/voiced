@@ -3,19 +3,33 @@
 import { spawn, type Subprocess } from "bun";
 import { readdirSync, existsSync, mkdirSync, writeFileSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES } from "./config.ts";
+import { PATHS, PORT, BASE_PORT, WHISPER_BIN, THREADS, STT_ALIASES, IDLE_MS, SPAWN_TIMEOUT_MS } from "./config.ts";
 import { diarizeInstalled, runDiarization, speakerForSegment } from "./diarize.ts";
 import { log } from "./logger.ts";
 import { withGate, gateStatus, setLimit } from "./gate.ts";
 
-type Child = { name: string; port: number; path: string; proc: Subprocess };
+// A model installed on disk. Its port is assigned once, at discovery, and kept
+// for the life of the process so a model always reappears on the same port.
+type Known = { name: string; path: string; port: number };
+
+// A running whisper-server. `inflight` counts requests currently using it;
+// eviction may only happen at zero, or a decode in progress would be killed.
+type Child = {
+  name: string; port: number; path: string; proc: Subprocess;
+  inflight: number; idle: ReturnType<typeof setTimeout> | null;
+};
 
 // Per-request log context: a short id shared by the request's req.start/req.end
 // lines, plus fields the handler enriches (model, bytes, cancellation, …).
 // `local` is true when the connection came from loopback — it gates /admin/*.
 type ReqCtx = { id: string; fields: Record<string, unknown>; local: boolean };
 
+const known = new Map<string, Known>();
 const children = new Map<string, Child>();
+// In-flight spawns, keyed by model name. Two requests arriving together for an
+// unloaded model must await ONE spawn, not race two whisper-servers onto the
+// same port.
+const starting = new Map<string, Promise<Child | null>>();
 let shuttingDown = false;
 
 function discoverSttModels(): Array<{ name: string; path: string }> {
@@ -47,38 +61,121 @@ function spawnChild(modelPath: string, port: number): Subprocess {
   });
 }
 
-function supervise(name: string, modelPath: string, port: number) {
+// Stop a child and forget it. Deleting from the map FIRST is what tells the
+// exit handler this was deliberate, so it does not respawn what we just evicted.
+function stopChild(name: string, why: string) {
+  const c = children.get(name);
+  if (!c) return;
+  children.delete(name);
+  if (c.idle) clearTimeout(c.idle);
+  try { c.proc.kill("SIGTERM"); } catch {}
+  log("child-stop", { name, why });
+}
+
+function clearIdle(c: Child) {
+  if (c.idle) { clearTimeout(c.idle); c.idle = null; }
+}
+
+// Arm the idle timer, but only when nothing is using the child. Called on every
+// release; the guard is what makes a burst of requests hold the model open.
+function armIdle(c: Child) {
+  clearIdle(c);
+  if (IDLE_MS <= 0 || c.inflight > 0) return;
+  c.idle = setTimeout(() => {
+    // Re-check under the timer: a request may have arrived in the gap.
+    const live = children.get(c.name);
+    if (!live || live !== c || live.inflight > 0) return;
+    stopChild(c.name, "idle");
+  }, IDLE_MS);
+}
+
+// Bracket one request's use of a child. The release must run on every path,
+// including a throw or a client cancel, or the model is pinned in memory for
+// the life of the daemon -- which is the whole bug this exists to fix.
+async function withChild<T>(c: Child, fn: () => Promise<T>): Promise<T> {
+  c.inflight++;
+  clearIdle(c);
+  try {
+    return await fn();
+  } finally {
+    c.inflight--;
+    armIdle(c);
+  }
+}
+
+function supervise(name: string, modelPath: string, port: number): Child {
   const proc = spawnChild(modelPath, port);
-  children.set(name, { name, port, path: modelPath, proc });
+  const child: Child = { name, port, path: modelPath, proc, inflight: 0, idle: null };
+  children.set(name, child);
   proc.exited.then((code: number | null) => {
     log("child-exit", { name, code });
     // Respawn only a genuine crash: if the child was intentionally removed (or
     // replaced) its map entry is gone or holds a different proc, so we stop.
+    // An evicted child took the `children.delete` path, so it lands here too.
     if (!shuttingDown && children.get(name)?.proc === proc) {
-      setTimeout(() => supervise(name, modelPath, port), 2000);
+      children.delete(name);
+      setTimeout(() => { if (!shuttingDown && known.has(name)) void ensureChild(name); }, 2000);
     }
   });
+  return child;
 }
 
-function resolveModel(requested: string | null): Child | null {
-  if (!requested) return children.values().next().value ?? null;
+// Get a running child for `name`, spawning and waiting for readiness if it is
+// not loaded. Concurrent callers for the same name share one spawn.
+async function ensureChild(name: string): Promise<Child | null> {
+  const live = children.get(name);
+  if (live) { clearIdle(live); return live; }
+
+  const pending = starting.get(name);
+  if (pending) return pending;
+
+  const k = known.get(name);
+  if (!k) return null;
+
+  const p = (async (): Promise<Child | null> => {
+    const started = Date.now();
+    log("child-spawn", { name, port: k.port });
+    const child = supervise(k.name, k.path, k.port);
+    const ready = await waitReady(k.port, SPAWN_TIMEOUT_MS);
+    if (!ready) {
+      stopChild(name, "spawn-timeout");
+      log("child-spawn-failed", { name, ms: Date.now() - started }, "error");
+      return null;
+    }
+    log("child-ready", { name, ms: Date.now() - started });
+    armIdle(child);
+    return child;
+  })().finally(() => starting.delete(name));
+
+  starting.set(name, p);
+  return p;
+}
+
+// Resolve a requested model name (or the default) to an INSTALLED model. This
+// deliberately answers from `known`, not from what happens to be running -- a
+// model being unloaded is an implementation detail, not a 404.
+function resolveKnown(requested: string | null): Known | null {
+  if (!requested) {
+    const preferred = known.get(STT_ALIASES["whisper-1"] ?? "");
+    return preferred ?? known.values().next().value ?? null;
+  }
   const name = STT_ALIASES[requested] ?? requested;
-  return children.get(name) ?? null;
+  return known.get(name) ?? null;
 }
 
-// Lowest port at/above BASE_PORT not already taken by a child. Bounded by the
-// number of children.
+// Lowest port at/above BASE_PORT not already assigned to a known model.
 function nextFreePort(): number {
-  const used = new Set([...children.values()].map((c) => c.port));
+  const used = new Set([...known.values()].map((k) => k.port));
   let p = BASE_PORT;
   while (used.has(p)) p++;
   return p;
 }
 
-// Converge the running children to the models on disk: supervise any newly
-// added model, stop any whose file is gone. New children load in the
-// background (/health reflects readiness). The sole mutator of child lifecycle
-// outside boot/shutdown — `voiced add`/`rm` reach it via POST /admin/reload, so
+// Converge the KNOWN model set to what is on disk: register anything newly
+// added, forget anything whose file is gone and stop it if it happens to be
+// running. Registering does not load a model -- that happens on first use --
+// so `voiced add` is now free in memory terms. The sole mutator of the model
+// set outside boot; `voiced add`/`rm` reach it via POST /admin/reload, so
 // models change without a restart.
 function reloadModels(): { added: string[]; removed: string[]; models: string[] } {
   const found = discoverSttModels();
@@ -86,21 +183,20 @@ function reloadModels(): { added: string[]; removed: string[]; models: string[] 
   const added: string[] = [];
   const removed: string[] = [];
   for (const m of found) {
-    if (children.has(m.name)) continue;
-    supervise(m.name, m.path, nextFreePort());
+    if (known.has(m.name)) continue;
+    known.set(m.name, { name: m.name, path: m.path, port: nextFreePort() });
     added.push(m.name);
   }
   // Snapshot before mutating: deleting from the live map mid-iteration skips
   // entries.
-  const gone = [...children.keys()].filter((name) => !names.has(name));
+  const gone = [...known.keys()].filter((name) => !names.has(name));
   for (const name of gone) {
-    const c = children.get(name)!;
-    children.delete(name);              // delete first: the respawn guard then stops
-    try { c.proc.kill("SIGTERM"); } catch {}
+    known.delete(name);
+    stopChild(name, "removed");
     removed.push(name);
   }
   if (added.length || removed.length) log("reload", { added, removed });
-  return { added, removed, models: [...children.keys()] };
+  return { added, removed, models: [...known.keys()] };
 }
 
 async function waitReady(port: number, deadlineMs: number): Promise<boolean> {
@@ -138,11 +234,11 @@ function clientClosed(ctx: ReqCtx, reason: string): Response {
 }
 
 async function handleModels(): Promise<Response> {
-  const data = [...children.keys()].map((id) => ({
+  const data = [...known.keys()].map((id) => ({
     id, object: "model", created: 0, owned_by: "voiced",
   }));
   for (const alias of Object.keys(STT_ALIASES)) {
-    if (children.has(STT_ALIASES[alias])) {
+    if (known.has(STT_ALIASES[alias])) {
       data.push({ id: alias, object: "model", created: 0, owned_by: "voiced" });
     }
   }
@@ -166,14 +262,60 @@ async function handleTranscribe(req: Request, ctx: ReqCtx): Promise<Response> {
   if (!(file instanceof Blob)) return jsonError(400, "missing_file", "file is required");
 
   const requested = inForm.get("model");
-  const child = resolveModel(typeof requested === "string" ? requested : null);
-  if (!child) {
+  const k = resolveKnown(typeof requested === "string" ? requested : null);
+  if (!k) {
     return jsonError(404, "model_not_found",
-      `model '${String(requested)}' not loaded. available: ${[...children.keys()].join(", ")}`);
+      `model '${String(requested)}' not installed. available: ${[...known.keys()].join(", ")}`);
   }
 
-  if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child, signal, ctx);
-  return proxyTranscribe(inForm, file, child, signal, ctx);
+  // Load on demand. A cold model reads gigabytes off disk, so this is the one
+  // place a request can block for seconds; `ms_load` records how long.
+  const loadStart = Date.now();
+  const wasLoaded = children.has(k.name);
+  const child = await ensureChild(k.name);
+  if (!child) {
+    return jsonError(503, "model_unavailable",
+      `model '${k.name}' failed to start within ${SPAWN_TIMEOUT_MS}ms`);
+  }
+  if (!wasLoaded) ctx.fields.ms_load = Date.now() - loadStart;
+  ctx.fields.model = k.name;
+
+  return withChild(child, () => {
+    if (isTruthy(inForm.get("diarize"))) return transcribeWithDiarization(inForm, file, child, signal, ctx);
+    return proxyTranscribe(inForm, file, child, signal, ctx);
+  });
+}
+
+// POST to a child's /inference, retrying a CONNECTION-level failure.
+//
+// whisper-server serves one inference at a time on a single accept loop, so a
+// sibling request arriving while it is busy -- most likely right after a cold
+// spawn, when the first decode also pays Metal and model init -- is REFUSED at
+// the socket, not queued. Measured: 4 concurrent requests against a warm child
+// all succeed; the same 4 against a cold one returned 1 success and 3
+// "Unable to connect". Retrying is correct here precisely because the peer is
+// a local child we already waited for and know is up.
+//
+// Only connection failures are retried. An HTTP response of any status is the
+// child answering, and an abort is the client leaving; neither is retryable.
+async function postInference(
+  child: Child, body: FormData, signal: AbortSignal,
+): Promise<{ res: Response } | { abort: true } | { err: Error }> {
+  const url = `http://127.0.0.1:${child.port}/inference`;
+  let last: Error | null = null;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (signal.aborted) return { abort: true };
+    try {
+      return { res: await fetch(url, { method: "POST", body, signal }) };
+    } catch (err) {
+      if (isAbort(err)) return { abort: true };
+      last = err as Error;
+      // 250ms, 500ms, 1s, 2s, 4s -- ~7.75s total, comfortably longer than a
+      // first decode, and bounded so a genuinely dead child still reports.
+      await Bun.sleep(250 * 2 ** attempt);
+    }
+  }
+  return { err: last ?? new Error("unreachable") };
 }
 
 // Default (non-diarize) path: proxy straight to the child whisper-server.
@@ -190,14 +332,13 @@ async function proxyTranscribe(inForm: FormData, file: Blob, child: Child, signa
   }
   if (!inForm.has("response_format")) out.append("response_format", "json");
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out, signal });
-  } catch (err) {
-    if (isAbort(err)) return clientClosed(ctx, "upstream-fetch");
+  const attempt = await postInference(child, out, signal);
+  if ("abort" in attempt) return clientClosed(ctx, "upstream-fetch");
+  if ("err" in attempt) {
     return jsonError(502, "upstream_unreachable",
-      `whisper-server for '${child.name}' not reachable: ${(err as Error).message}`);
+      `whisper-server for '${child.name}' not reachable: ${attempt.err.message}`);
   }
+  const upstream: Response = attempt.res;
 
   let body: ArrayBuffer;
   try {
@@ -242,14 +383,16 @@ async function transcribeWav(
   }
   out.append("response_format", "verbose_json");
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(`http://127.0.0.1:${child.port}/inference`, { method: "POST", body: out, signal });
-  } catch (err) {
-    if (isAbort(err)) throw err; // unwound centrally by transcribeWithDiarization
-    return { ok: false, res: jsonError(502, "upstream_unreachable",
-      `whisper-server for '${child.name}' not reachable: ${(err as Error).message}`) };
+  const attempt = await postInference(child, out, signal);
+  if ("abort" in attempt) {
+    // unwound centrally by transcribeWithDiarization
+    throw Object.assign(new Error("aborted"), { name: "AbortError" });
   }
+  if ("err" in attempt) {
+    return { ok: false, res: jsonError(502, "upstream_unreachable",
+      `whisper-server for '${child.name}' not reachable: ${attempt.err.message}`) };
+  }
+  const upstream: Response = attempt.res;
   if (!upstream.ok) {
     const errBody = await upstream.arrayBuffer();
     return { ok: false, res: new Response(errBody, {
@@ -345,8 +488,17 @@ async function handleHealth(): Promise<Response> {
       upstreams[c.name] = false;
     }
   }));
-  const ok = Object.values(upstreams).every(Boolean) && children.size > 0;
-  return new Response(JSON.stringify({ ok, upstreams, ...gateStatus() }), {
+  // Idle is the normal steady state now, so "no children running" is healthy.
+  // What would be broken is having no model INSTALLED, or a loaded child that
+  // stopped answering.
+  const ok = Object.values(upstreams).every(Boolean) && known.size > 0;
+  return new Response(JSON.stringify({
+    ok,
+    models: [...known.keys()],
+    loaded: [...children.keys()],
+    upstreams,
+    ...gateStatus(),
+  }), {
     status: ok ? 200 : 503,
     headers: { "content-type": "application/json" },
   });
@@ -421,7 +573,10 @@ function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   log("shutdown");
-  for (const c of children.values()) { try { c.proc.kill("SIGTERM"); } catch {} }
+  for (const c of children.values()) {
+    if (c.idle) clearTimeout(c.idle);
+    try { c.proc.kill("SIGTERM"); } catch {}
+  }
   releaseLock();
   setTimeout(() => process.exit(0), 1500);
 }
@@ -463,9 +618,8 @@ export async function runServer(): Promise<void> {
     process.exit(1);
   }
 
-  log("boot", { models: found.map((m) => m.name) });
-  found.forEach((m, i) => supervise(m.name, m.path, BASE_PORT + i));
-  await Promise.all([...children.values()].map((c) => waitReady(c.port, 60_000)));
+  found.forEach((m, i) => known.set(m.name, { name: m.name, path: m.path, port: BASE_PORT + i }));
+  log("boot", { models: found.map((m) => m.name), idle_ms: IDLE_MS });
 
   try {
     Bun.serve({
@@ -495,5 +649,5 @@ export async function runServer(): Promise<void> {
     process.exit(1);
   }
 
-  log("listening", { port: PORT, models: [...children.keys()] });
+  log("listening", { port: PORT, models: [...known.keys()] });
 }

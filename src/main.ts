@@ -3,6 +3,7 @@ import { VERSION } from "./config.ts";
 import {
   cmdLs, cmdAdd, cmdRm, cmdDoctor, cmdHelp,
   cmdStart, cmdStop, cmdRestart, cmdStatus, cmdDiarize, cmdLog, cmdLimit, cmdReload,
+  cmdEnable, cmdDisable,
 } from "./cli.ts";
 
 const [, , cmd, ...rest] = process.argv;
@@ -30,6 +31,12 @@ switch (cmd) {
     break;
   case "restart":
     cmdRestart();
+    break;
+  case "enable":
+    cmdEnable();
+    break;
+  case "disable":
+    cmdDisable();
     break;
   case "status":
     await cmdStatus();
