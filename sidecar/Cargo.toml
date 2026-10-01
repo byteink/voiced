@@ -11,7 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 # NVIDIA Sortformer v2 diarization via ONNX Runtime (CPU). No Python.
-parakeet-rs = { version = "0.3.6", features = ["sortformer"] }
+# Pinned: 0.3.8 drops DiarizationConfig::callhome (Sortformer v3 migration).
+parakeet-rs = { version = "=0.3.7", features = ["sortformer"] }
 hound = "3"
 
 [profile.release]
